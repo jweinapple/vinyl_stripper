@@ -69,3 +69,4 @@ echo ""
 echo "✓ Mode switched to: $MODE"
 echo "View logs with: sudo journalctl -u $SERVICE -f"
 
+

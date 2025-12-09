@@ -315,3 +315,4 @@ aplay -D hw:1,0 test.wav          # Playback
 - Verify device indices: `python3 vinyl_stripper.py --list-devices`
 - Check permissions: `sudo usermod -a -G audio pi`
 
+
