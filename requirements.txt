@@ -1,0 +1,6 @@
+torch
+torchaudio
+sounddevice
+numpy
+demucs
+soundfile
