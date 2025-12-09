@@ -4,203 +4,222 @@ Real-time vocal/drum removal for vinyl playback. Play a record, hear it without 
 
 **Workflow**: Sound Burger → Raspberry Pi → Headphones
 
+## Features
+
+- 🎵 Real-time stem separation using Demucs
+- 🎧 Remove vocals, drums, bass, or other stems
+- 🔌 Auto-detects USB audio interfaces (UCA202, etc.)
+- 🚀 Optimized for Raspberry Pi 5
+- ⚡ Low latency (~4-5 seconds)
+- 🎛️ Device nicknames: `ua` (Universal Audio), `sid` (SoundID), `usb` (USB audio)
+
 ## Quick Start (Raspberry Pi)
-
-See [RASPBERRY_PI_SETUP.md](RASPBERRY_PI_SETUP.md) for complete Raspberry Pi setup guide.
-
-**Not sure what hardware to buy?** See [HARDWARE_COMPARISON.md](HARDWARE_COMPARISON.md) for detailed comparison and shopping list.
 
 ```bash
 # 1. Setup (one time)
 ./edge_setup.sh
 
 # 2. Connect hardware:
-#    Sound Burger LINE OUT → ADC input (HiFiBerry ADC+ or USB dongle)
-#    Headphones → innomaker HiFi DAC HAT (3.5mm or RCA outputs)
+#    Sound Burger LINE OUT → USB audio interface (UCA202) RCA inputs
+#    Headphones → USB audio interface headphone output
 
 # 3. Run (auto-detects devices)
 python3 vinyl_stripper.py --remove vocals
 ```
 
-## Testing with Streaming Audio
+See [RASPBERRY_PI_SETUP.md](RASPBERRY_PI_SETUP.md) for complete setup guide.
 
-Test the stem separation without vinyl hardware using streaming audio:
-
-```bash
-# List available audio devices
-python3 test_streaming.py --list-devices
-
-# Test with Universal Audio Thunderbolt interface (Apollo, etc.)
-python3 test_streaming.py --input ua --remove vocals
-
-# Test with microphone input
-python3 test_streaming.py --input mic --remove vocals
-
-# Test with system audio loopback (requires BlackHole on Mac)
-python3 test_streaming.py --input loopback --remove vocals
-
-# Test with specific devices
-python3 test_streaming.py --input 1 --output 0 --remove vocals
-```
-
-**For Universal Audio Apollo/Thunderbolt:**
-- Connect Sound Burger LINE OUT → Apollo inputs
-- Run: `python3 test_streaming.py --input ua --remove vocals`
-- Or use main script: `python3 vinyl_stripper.py --input <apollo_device_index> --output <apollo_device_index>`
-
-**For macOS loopback (to capture system audio):**
-1. Install BlackHole: https://github.com/ExistentialAudio/BlackHole
-2. Set BlackHole as output device in System Preferences
-3. Run: `python3 test_streaming.py --input loopback --remove vocals`
-4. Play music from Spotify/YouTube/etc. - it will be processed!
-
-## Driver Requirements
-
-**For the app: NO drivers needed** - uses standard system audio APIs.
-
-**For Universal Audio Apollo: YES** - install UAD software from https://www.uaudio.com/uad/downloads.html
-
-See [DRIVER_REQUIREMENTS.md](DRIVER_REQUIREMENTS.md) for complete details.
-
-## Setup (Mac - Development/Testing)
-
-### 1. Install Universal Audio Drivers (if using Apollo)
-
-Download and install UAD software from Universal Audio:
-- https://www.uaudio.com/uad/downloads.html
-- Includes Thunderbolt/USB drivers for Apollo interfaces
-- Restart computer after installation
-
-### 2. Install Python dependencies
+## Quick Start (macOS - Development)
 
 ```bash
-# Create a virtual environment (recommended)
+# 1. Create virtual environment
 python3 -m venv venv
 source venv/bin/activate
 
-# Install dependencies
-pip3 install torch torchaudio sounddevice numpy
+# 2. Install dependencies
+pip3 install -r requirements.txt
 
-# Install demucs
-pip3 install demucs
-```
-
-### 2. Find your audio devices
-
-```bash
+# 3. List audio devices
 python3 vinyl_stripper.py --list-devices
+
+# 4. Run with device nicknames
+python3 vinyl_stripper.py --input ua --output sid --remove vocals
 ```
 
-Look for your Apollo Twin in the list. Note the index numbers for input and output.
+## Usage
 
-Example output:
-```
-  0 Built-in Microphone, Core Audio (2 in, 0 out)
-  1 Apollo Twin USB, Core Audio (2 in, 2 out)    <-- use this
-  2 Built-in Output, Core Audio (0 in, 2 out)
-```
-
-### 3. Connect your turntable
-
-```
-Sound Burger (line out) → 1/8" to 1/4" cable → Apollo Twin inputs
-Apollo Twin outputs → Headphones or monitors
-```
-
-Make sure the Sound Burger is set to LINE out (not phono).
-
-### 4. Run it
+### Basic Commands
 
 ```bash
+# List available audio devices
+python3 vinyl_stripper.py --list-devices
+
 # Remove vocals (default)
-python3 vinyl_stripper.py --input 1 --output 1 --remove vocals
+python3 vinyl_stripper.py --input ua --output sid --remove vocals
 
 # Remove drums
-python3 vinyl_stripper.py --input 1 --output 1 --remove drums
+python3 vinyl_stripper.py --input ua --output sid --remove drums
 
-# Remove both vocals and drums (just bass + other)
-python3 vinyl_stripper.py --input 1 --output 1 --remove both
+# Remove both vocals and drums
+python3 vinyl_stripper.py --input ua --output sid --remove vocals drums
+
+# Use specific device indices
+python3 vinyl_stripper.py --input 1 --output 1 --remove vocals
+
+# Use different model
+python3 vinyl_stripper.py --model htdemucs --input ua --output sid --remove vocals
 ```
 
-Replace `1` with your actual Apollo Twin device index.
+### Device Nicknames
+
+- `ua` or `apollo` - Universal Audio Thunderbolt interface
+- `sid` or `soundid` - SoundID Reference output device
+- `usb` - USB audio interface (UCA202, Behringer, etc.)
+
+### Available Models
+
+- `htdemucs` - Baseline Hybrid Transformer (fastest)
+- `htdemucs_ft` - Fine-tuned version (default, best quality)
+- `htdemucs_6s` - 6 sources (adds piano/guitar stems)
 
 ## Options
 
-| Flag | Description |
-|------|-------------|
-| `--list-devices` | Show available audio devices |
-| `-i`, `--input` | Input device index |
-| `-o`, `--output` | Output device index |
-| `--remove` | What to remove: `vocals`, `drums`, `both`, or `none` |
-| `--model` | Demucs model (default: `htdemucs`) |
-| `--chunk` | Chunk duration in seconds (default: 3.0) |
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--list-devices` | Show available audio devices | - |
+| `-i`, `--input` | Input device index or nickname | Auto-detect |
+| `-o`, `--output` | Output device index or nickname | Auto-detect |
+| `--remove` | Stems to remove: `vocals`, `drums`, `bass`, `other`, `all` | `vocals` |
+| `--model` | Demucs model: `htdemucs`, `htdemucs_ft`, `htdemucs_6s` | `htdemucs_ft` |
+| `--chunk` | Chunk duration in seconds | `5.0` |
+
+## Hardware Setup
+
+### Raspberry Pi 5 Setup
+
+**Required Hardware:**
+- Raspberry Pi 5 (8GB recommended)
+- USB audio interface (Behringer UCA202 recommended)
+- USB-C power bank (20,000mAh+)
+- MicroSD card (64GB+)
+
+**Audio Flow:**
+```
+Sound Burger (LINE OUT)
+    ↓ 3.5mm-to-RCA cable
+USB Audio Interface (UCA202) RCA inputs
+    ↓ USB
+Raspberry Pi 5 (processing)
+    ↓ USB
+USB Audio Interface headphone output
+    ↓
+Headphones
+```
+
+See [RASPBERRY_PI_SETUP.md](RASPBERRY_PI_SETUP.md) for detailed setup instructions.
+
+### Hailo NPU Support
+
+For Raspberry Pi 5 with Hailo-8L NPU acceleration, see [HAILO_SETUP.md](HAILO_SETUP.md).
 
 ## Expected Behavior
 
-- **Latency:** ~3-4 seconds from input to output
-- **First few seconds:** Silence while the buffer fills
-- **Quality:** Should sound clean, similar to offline Demucs processing
+- **Latency:** ~4-5 seconds from input to output
+- **First few seconds:** Silence while buffer fills (~10 seconds)
+- **Quality:** Clean separation, optimized for real-time processing
+- **CPU Usage:** 80-100% on Raspberry Pi 5
 
 ## Troubleshooting
 
 **No sound output:**
-- Check that your Apollo Twin is set as the output device in the script AND in macOS Sound preferences
-- Make sure the turntable is set to LINE out
-- Check input levels in your Apollo Console app
+- Run `--list-devices` to verify device detection
+- Check audio interface connections
+- Ensure turntable is set to LINE out (not phono)
 
 **Choppy/glitchy audio:**
-- Try increasing chunk size: `--chunk 5.0`
+- Try increasing chunk size: `--chunk 10.0`
 - Close other applications
-- Make sure you're on power (not battery)
-
-**Model download fails:**
-- Demucs downloads models on first run (~1GB for htdemucs)
-- Make sure you have internet connectivity
+- Ensure adequate power supply
 
 **"Device not found" error:**
-- Run `--list-devices` and double-check the index numbers
+- Run `--list-devices` to see available devices
+- Use device index numbers instead of nicknames
+- Check USB audio interface is connected
 
-## Product Workflow
+**Model download fails:**
+- Demucs downloads models automatically on first use (~500MB)
+- Ensure internet connectivity
+- Models are cached for future use
+
+**Passthrough mode warning:**
+- Processing can't keep up with real-time
+- Audio will play unprocessed (better than silence)
+- Try reducing chunk size or using `htdemucs` model
+
+## Switching Modes (Raspberry Pi)
+
+If running as a systemd service, use the mode switching script:
+
+```bash
+# Remove vocals
+./switch_mode.sh vocals
+
+# Remove drums
+./switch_mode.sh drums
+
+# Remove both
+./switch_mode.sh both
+
+# No removal (passthrough)
+./switch_mode.sh none
+```
+
+## Architecture
 
 ```
 ┌─────────────┐
 │ Sound Burger│  (Audio-Technica portable turntable)
 │  LINE OUT   │
 └──────┬──────┘
-       │ 3.5mm cable
+       │ 3.5mm-to-RCA cable
        ▼
 ┌──────────────────┐
-│ ADC Board        │  (Input: HiFiBerry ADC+ or USB dongle)
-│ (Audio Input)    │
+│ USB Audio        │  (Behringer UCA202)
+│ Interface        │  RCA inputs → USB → Pi
 └──────┬───────────┘
-       │ GPIO/USB
+       │ USB
        ▼
 ┌──────────────┐
 │ Raspberry Pi │  (Real-time stem separation)
-│     5        │
+│     5        │  Demucs model processing
 └──────┬───────┘
-       │ GPIO
+       │ USB
        ▼
 ┌──────────────────┐
-│ innomaker DAC    │  (High-quality output: 112dB SNR)
-│ HAT (PCM5122)    │
-│ 3.5mm/RCA Output │
+│ USB Audio        │  Headphone output
+│ Interface        │
 └──────┬───────────┘
        │
        ▼
   ┌─────────┐
-  │Headphones│  (Listen to processed audio)
+  │Headphones│  (Processed audio)
   └─────────┘
 ```
 
-## Edge Computing Product
+## Requirements
 
-This is designed as a portable edge computing device:
+- Python 3.8+
+- PyTorch
+- Demucs
+- sounddevice
+- numpy
 
-- **Hardware**: Raspberry Pi 5 + USB Audio Interface
-- **Power**: USB-C Power Bank (2-3 hours runtime)
-- **Size**: Fits in bag with Sound Burger
-- **Latency**: ~5-6 seconds
-- **Quality**: Good (optimized for CPU)
+See `requirements.txt` for complete list.
 
-See [EDGE_PRODUCT_ROADMAP.md](EDGE_PRODUCT_ROADMAP.md) for full product roadmap.
+## License
+
+This project uses the Demucs library for stem separation. See individual library licenses.
+
+## Contributing
+
+This is a personal project optimized for Raspberry Pi deployment. For issues or improvements, please open an issue on GitHub.

@@ -95,8 +95,7 @@ class VinylStripper:
             self.model = get_model(model_name)
         except Exception as e:
             print(f"Error loading model '{model_name}': {e}")
-            print("\nAvailable models: htdemucs, htdemucs_ft, htdemucs_6s, hdemucs_mmi, mdx, mdx_q, mdx_extra_q")
-            print("Note: mdx_extra is not recommended for real-time processing")
+            print("\nAvailable models: htdemucs, htdemucs_ft, htdemucs_6s")
             raise
         self.model.to(self.device)
         self.model.eval()
@@ -479,7 +478,7 @@ Examples:
     python3 vinyl_stripper.py --remove all
     
 Device nicknames: ua (Universal Audio), sid (SoundID Reference), usb (USB audio)
-Available models: htdemucs, htdemucs_ft (default), htdemucs_6s, hdemucs_mmi, mdx, mdx_q, mdx_extra_q
+Available models: htdemucs, htdemucs_ft (default), htdemucs_6s
 Available stems: vocals, drums, bass, other
         """
     )
@@ -503,7 +502,7 @@ Available stems: vocals, drums, bass, other
         "--model",
         type=str,
         default="htdemucs_ft",
-        help="Demucs model name (default: htdemucs_ft). Available: htdemucs, htdemucs_ft, htdemucs_6s, hdemucs_mmi, mdx, mdx_q, mdx_extra_q"
+        help="Demucs model name (default: htdemucs_ft). Available: htdemucs, htdemucs_ft, htdemucs_6s"
     )
     
     args = parser.parse_args()

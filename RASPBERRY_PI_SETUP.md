@@ -371,7 +371,7 @@ The code automatically uses optimized model (`htdemucs_ft`) on CPU, which is mor
 - **Latency**: 5-6 seconds (with 5s chunks)
 - **CPU Usage**: 80-100% on Raspberry Pi 5
 - **Memory**: ~2GB RAM usage
-- **Quality**: Good (slightly lower than desktop `mdx_extra` but acceptable)
+- **Quality**: Good (real-time processing optimized for Raspberry Pi)
 - **Battery**: 2-3 hours continuous use
 
 ## Cost Breakdown
