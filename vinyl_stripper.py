@@ -17,6 +17,10 @@ import threading
 import queue
 import numpy as np
 from collections import deque
+import logging
+import os
+import traceback
+from datetime import datetime
 
 # Check dependencies before importing
 def check_dependencies():
@@ -51,6 +55,78 @@ import torch
 from demucs.pretrained import get_model
 from demucs.apply import apply_model
 
+# Setup logging
+def setup_logging():
+    """Setup logging to both file and console."""
+    log_dir = os.path.expanduser("~/vinyl_stripper/logs")
+    os.makedirs(log_dir, exist_ok=True)
+    
+    log_file = os.path.join(log_dir, f"vinyl_stripper_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    
+    # Create logger
+    logger = logging.getLogger('vinyl_stripper')
+    logger.setLevel(logging.DEBUG)
+    
+    # Remove existing handlers
+    logger.handlers.clear()
+    
+    # File handler (detailed)
+    file_handler = logging.FileHandler(log_file, mode='w')
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+    
+    # Console handler (info and above)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_formatter = logging.Formatter('%(message)s')
+    console_handler.setFormatter(console_formatter)
+    logger.addHandler(console_handler)
+    
+    # Log startup info
+    logger.info(f"Logging initialized - log file: {log_file}")
+    
+    return logger
+
+logger = setup_logging()
+
+def log_memory_status(stage=""):
+    """Log current memory status."""
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+        logger.info(f"Memory status {stage}:")
+        logger.info(f"  RAM: {mem.used / (1024**3):.2f}GB / {mem.total / (1024**3):.2f}GB ({mem.percent}% used)")
+        logger.info(f"  Available: {mem.available / (1024**3):.2f}GB")
+        logger.info(f"  Swap: {swap.used / (1024**3):.2f}GB / {swap.total / (1024**3):.2f}GB ({swap.percent}% used)")
+        return mem.available, mem.percent
+    except ImportError:
+        # Fallback to /proc/meminfo on Linux
+        try:
+            if os.path.exists('/proc/meminfo'):
+                with open('/proc/meminfo', 'r') as f:
+                    meminfo = f.read()
+                for line in meminfo.split('\n'):
+                    if 'MemAvailable' in line:
+                        available_kb = int(line.split()[1])
+                        logger.info(f"Memory status {stage}: Available: {available_kb / (1024**2):.2f}GB")
+                        return available_kb * 1024, None
+        except:
+            pass
+        # Final fallback
+        try:
+            import resource
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            logger.info(f"Memory usage {stage}: {usage.ru_maxrss / 1024:.2f}MB")
+        except:
+            logger.warning("Could not determine memory status")
+        return None, None
+
 
 class VinylStripper:
     def __init__(
@@ -59,7 +135,7 @@ class VinylStripper:
         output_device: int,
         remove_stems: list[str],
         chunk_duration: float = 0.25,  # seconds per chunk (very small for fastest processing)
-        overlap: float = 0.1,  # minimal overlap for faster processing
+        overlap: float = 0.03,  # overlap for smoother transitions (increased to prevent gaps)
         sample_rate: int = 44100,
         model_name: str = None,  # Model name (default: htdemucs_ft)
     ):
@@ -77,28 +153,66 @@ class VinylStripper:
         self.hop_samples = self.chunk_samples - self.overlap_samples
         
         self.input_buffer = deque(maxlen=self.chunk_samples * 16)
-        self.output_queue = queue.Queue(maxsize=50)
+        self.output_queue = queue.Queue(maxsize=100)  # Increased buffer size
         self.output_buffer = np.zeros((0, 2), dtype=np.float32)
-        self.passthrough_buffer = deque(maxlen=int(sample_rate * 3))
-        self.processing_queue = queue.Queue(maxsize=20)
+        self.passthrough_buffer = deque(maxlen=int(sample_rate * 5))  # Increased passthrough buffer
+        self.processing_queue = queue.Queue(maxsize=30)  # Increased processing queue
         self.running = False
         self.buffer_filling = True
-        self.use_passthrough = False
+        self.use_passthrough = False  # Disabled - only play processed audio
+        self.last_buffer_log = 0
+        self.buffer_log_interval = 5.0  # Log buffer status every 5 seconds
+        self.min_buffer_before_switch = int(sample_rate * 3.0)  # Need at least 3s before switching from passthrough (reduced from 5s)
         
         # Load model with device-specific optimization
         # Reference torch before any local imports to avoid UnboundLocalError
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         model_name = self.model_name if self.model_name else "htdemucs_ft"
-        print(f"Loading model: {model_name} (device: {self.device})...")
+        
+        logger.info(f"Loading model: {model_name} (device: {self.device})...")
+        
+        # Check memory before loading
+        available_mem, mem_percent = log_memory_status("before model load")
+        if available_mem and available_mem < 1.0 * (1024**3):  # Less than 1GB available
+            logger.warning(f"Low memory available ({available_mem / (1024**3):.2f}GB). Model loading may fail.")
+            logger.warning("Consider using lighter model (htdemucs) or increasing swap space.")
         
         try:
+            # Set environment variables for better CPU performance
+            # Use more threads for better parallel processing
+            import multiprocessing
+            num_threads = min(multiprocessing.cpu_count(), 4)  # Use up to 4 threads
+            os.environ['OMP_NUM_THREADS'] = str(num_threads)
+            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+            logger.info(f"Using {num_threads} CPU threads for processing")
+            
+            logger.info("Fetching model from demucs...")
             self.model = get_model(model_name)
-        except Exception as e:
-            print(f"Error loading model '{model_name}': {e}")
-            print("\nAvailable models: htdemucs, htdemucs_ft, htdemucs_6s")
+            logger.info("Model downloaded successfully")
+            
+            # Check memory after download
+            log_memory_status("after model download")
+            
+            logger.info(f"Moving model to device: {self.device}")
+            self.model.to(self.device)
+            self.model.eval()
+            logger.info("Model loaded and ready")
+            
+        except MemoryError as e:
+            logger.error(f"Out of memory while loading model: {e}")
+            log_memory_status("OOM error")
+            logger.error("Model loading failed due to insufficient memory.")
+            logger.error("Solutions:")
+            logger.error("  1. Use lighter model: --model htdemucs")
+            logger.error("  2. Increase swap space: sudo fallocate -l 2G /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile")
+            logger.error("  3. Close other applications to free memory")
             raise
-        self.model.to(self.device)
-        self.model.eval()
+        except Exception as e:
+            logger.error(f"Error loading model '{model_name}': {e}")
+            logger.error(f"Exception type: {type(e).__name__}")
+            logger.error(f"Traceback:\n{traceback.format_exc()}")
+            logger.error("\nAvailable models: htdemucs, htdemucs_ft, htdemucs_6s")
+            raise
         
         # Optimize model for inference
         try:
@@ -111,8 +225,9 @@ class VinylStripper:
             if hasattr(torch, 'compile') and self.device != 'cpu':
                 try:
                     self.model = torch.compile(self.model, mode='reduce-overhead')
-                    print("✓ Model compiled")
-                except Exception:
+                    logger.info("✓ Model compiled")
+                except Exception as e:
+                    logger.debug(f"Model compilation skipped: {e}")
                     pass
             
             if self.device == "cpu":
@@ -121,8 +236,9 @@ class VinylStripper:
                     self.model = torch_quantization.quantize_dynamic(
                         self.model, {torch.nn.Linear}, dtype=torch.qint8
                     )
-                    print("✓ Model quantized")
-                except Exception:
+                    logger.info("✓ Model quantized")
+                except Exception as e:
+                    logger.debug(f"Model quantization skipped: {e}")
                     pass
         
         # Stem indices in demucs output: drums, bass, other, vocals
@@ -133,8 +249,13 @@ class VinylStripper:
             "vocals": 3,
         }
         
-        print(f"Removing: {', '.join(remove_stems)}")
-        print(f"Chunk: {chunk_duration}s, Overlap: {overlap*100}%, Latency: ~{chunk_duration + 1:.1f}s\n")
+        logger.info(f"Removing: {', '.join(remove_stems)}")
+        logger.info(f"Stem indices: {self.stem_indices}")
+        logger.info(f"Will keep: {[s for s in self.stem_indices.keys() if s not in remove_stems]}")
+        logger.info(f"Chunk: {chunk_duration}s, Overlap: {overlap*100}%, Latency: ~{chunk_duration + 1:.1f}s")
+        
+        # Final memory check
+        log_memory_status("after initialization")
 
     def process_chunk(self, audio: np.ndarray) -> np.ndarray:
         """Run stem separation on a chunk and return audio with stems removed."""
@@ -143,60 +264,189 @@ class VinylStripper:
         
         # Normalize
         ref = audio_tensor.mean(0)
-        audio_tensor = (audio_tensor - ref.mean()) / ref.std()
+        ref_std = ref.std()
+        # Avoid division by zero
+        if ref_std < 1e-8:
+            ref_std = torch.tensor(1.0, device=self.device)
+        audio_tensor = (audio_tensor - ref.mean()) / ref_std
         
-        with torch.no_grad():
-            # Apply model - returns (batch, stems, channels, samples)
-            # Use smaller segment size for faster processing (reduces memory but speeds up inference)
-            sources = apply_model(
-                self.model, 
-                audio_tensor, 
-                device=self.device,
-                segment=None,  # Process entire chunk at once (faster for small chunks)
-                split=False,  # Disable splitting for speed (we're already chunking)
-                shifts=1,  # Single shift for speed (default is 1)
-                overlap=0.0,  # No overlap needed since we handle it in chunking
-            )
+        try:
+            with torch.no_grad():
+                # Apply model - returns (batch, stems, channels, samples)
+                # Optimized for longer chunks and better memory management
+                chunk_length = audio_tensor.shape[-1]
+                chunk_duration = chunk_length / self.sample_rate
+                
+                # Configure segment size based on device and chunk size
+                # For CPU, use larger segments to process more audio at once
+                # For CUDA, can process entire chunk
+                if self.device == "cuda":
+                    # GPU can handle larger chunks
+                    segment_size = None  # Process entire chunk
+                    use_split = False
+                else:
+                    # CPU: Use larger segments for better throughput
+                    # Process in 4-8 second segments for better efficiency
+                    if chunk_duration <= 4.0:
+                        # Small chunk - process whole thing
+                        segment_size = None
+                        use_split = False
+                    else:
+                        # Larger chunk - use 6 second segments
+                        segment_size = int(self.sample_rate * 6.0)  # 6 second segments
+                        use_split = True
+                
+                logger.debug(f"Processing chunk: {chunk_duration:.2f}s, segment={segment_size}, split={use_split}, device={self.device}")
+                
+                sources = apply_model(
+                    self.model, 
+                    audio_tensor, 
+                    device=self.device,
+                    segment=segment_size,  # None for whole chunk, or segment size
+                    split=use_split,  # Enable splitting for large chunks
+                    shifts=1,  # Single shift for speed
+                    overlap=0.25,  # Small overlap for smoother transitions
+                    progress=False,  # Disable progress bar
+                )
+                
+                logger.debug(f"Model returned sources: shape={sources.shape}")
+        except Exception as e:
+            logger.error(f"Error in apply_model: {type(e).__name__}: {e}")
+            logger.error(f"Traceback:\n{traceback.format_exc()}")
+            raise
         
         # sources shape: (1, 4, 2, samples)
         # stems are: drums, bass, other, vocals
         
+        # Debug: Check if we're getting valid output from model
+        if sources.shape[1] != 4:
+            logger.error(f"Unexpected number of stems: {sources.shape[1]} (expected 4)")
+        
         # Sum all stems except the ones we want to remove
         output = torch.zeros_like(audio_tensor)
+        stems_kept = []
+        stems_removed = []
         for stem_name, idx in self.stem_indices.items():
             if stem_name not in self.remove_stems:
                 output += sources[0, idx]
+                stems_kept.append(stem_name)
+            else:
+                stems_removed.append(stem_name)
         
-        # Denormalize
-        output = output * ref.std() + ref.mean()
+        # Debug logging (first chunk only)
+        if not hasattr(self, '_logged_first_chunk'):
+            logger.info(f"Processing first chunk: Keeping {stems_kept}, Removing {stems_removed}")
+            logger.info(f"Output shape: {output.shape}, Mean: {output.mean().item():.6f}, Std: {output.std().item():.6f}")
+            logger.info(f"Sources stats - Drums: {sources[0, 0].mean().item():.6f}, Bass: {sources[0, 1].mean().item():.6f}, Other: {sources[0, 2].mean().item():.6f}, Vocals: {sources[0, 3].mean().item():.6f}")
+            self._logged_first_chunk = True
+        
+        # Denormalize - use original reference stats
+        ref_std = ref.std()
+        ref_mean = ref.mean()
+        # Avoid division by zero in denormalization
+        if ref_std < 1e-8:
+            ref_std = torch.tensor(1.0, device=self.device)
+        
+        output = output * ref_std + ref_mean
+        
+        # Check for silence (all zeros or very quiet) - only log first time
+        if not hasattr(self, '_checked_silence'):
+            output_std = output.std().item()
+            output_mean = output.mean().item()
+            logger.info(f"Output stats after denormalization: Mean={output_mean:.6f}, Std={output_std:.6f}")
+            if output_std < 1e-6:
+                logger.warning(f"⚠ Output is very quiet (std: {output_std:.2e}) - possible processing issue")
+            self._checked_silence = True
         
         # Convert back to numpy (samples, channels)
-        return output.squeeze(0).T.cpu().numpy()
+        result = output.squeeze(0).T.cpu().numpy()
+        
+        # Final check - ensure we have valid audio
+        if np.allclose(result, 0, atol=1e-6):
+            logger.error("⚠ Output is all zeros - processing failed!")
+        
+        return result
 
     def processing_worker(self):
         """Background thread that processes audio chunks."""
+        chunks_processed = 0
+        chunks_failed = 0
+        import time as time_module
+        
+        logger.info("Processing worker started")
         while self.running:
             try:
                 chunk = self.processing_queue.get(timeout=0.5)
             except queue.Empty:
+                # Log if queue is backing up
+                queue_size = self.processing_queue.qsize()
+                if queue_size > 10 and chunks_processed == 0:
+                    logger.warning(f"⚠ Processing queue backing up ({queue_size} queued) but no chunks processed yet - worker may be stuck")
                 continue
             
             if chunk is None:
                 break
                 
             try:
+                # Time the processing to see how long it takes
+                start_time = time_module.time()
+                logger.debug(f"Starting to process chunk (queue size: {self.processing_queue.qsize()})")
+                
                 processed = self.process_chunk(chunk)
+                processing_time = time_module.time() - start_time
+                
+                # Check if output is valid
+                if processed is None or processed.size == 0:
+                    logger.error(f"⚠ Processed chunk is None or empty!")
+                    chunks_failed += 1
+                    continue
+                
                 self.output_queue.put(processed)
+                chunks_processed += 1
+                
+                # Log first few chunks and then periodically
+                if chunks_processed <= 5 or chunks_processed % 5 == 0:
+                    chunk_duration = len(chunk) / self.sample_rate
+                    realtime_factor = chunk_duration / processing_time if processing_time > 0 else 0
+                    logger.info(f"✓ Processed chunk {chunks_processed}: {processing_time:.2f}s for {chunk_duration:.2f}s audio (RTF: {realtime_factor:.2f}x)")
+                    if realtime_factor < 1.0:
+                        logger.warning(f"⚠ Processing slower than real-time! Need {1.0/realtime_factor:.1f}x speedup")
+                
+                if chunks_processed % 10 == 0:
+                    logger.debug(f"Processed {chunks_processed} chunks (output queue: {self.output_queue.qsize()}, failed: {chunks_failed})")
+            except KeyboardInterrupt:
+                logger.info("Processing worker interrupted")
+                break
             except Exception as e:
-                print(f"Processing error: {e}")
+                chunks_failed += 1
+                logger.error(f"✗ Processing error on chunk {chunks_processed + chunks_failed}: {type(e).__name__}: {e}")
+                logger.error(f"Traceback:\n{traceback.format_exc()}")
+                # Don't break - keep trying to process other chunks
+                if chunks_failed > 10:
+                    logger.error("Too many processing failures - stopping worker")
+                    break
+        
+        logger.info(f"Processing worker stopped (processed {chunks_processed} chunks, failed {chunks_failed})")
 
     def audio_callback(self, indata, outdata, frames, time, status):
         """Called by sounddevice for each audio block."""
         if status:
-            print(f"Audio status: {status}")
+            logger.debug(f"Audio status: {status}")
         
-        # Store raw audio for passthrough fallback
-        self.passthrough_buffer.extend(indata.copy())
+        # Periodic buffer health monitoring
+        import time as time_module
+        current_time = time_module.time()
+        if current_time - self.last_buffer_log > self.buffer_log_interval:
+            buffer_seconds = self.output_buffer.shape[0] / self.sample_rate
+            queue_size = self.processing_queue.qsize()
+            output_queue_size = self.output_queue.qsize()
+            mode = "passthrough" if self.use_passthrough else "processed"
+            min_needed = self.min_buffer_before_switch / self.sample_rate
+            logger.info(f"Buffer status: {buffer_seconds:.1f}s ({mode}), need {min_needed:.1f}s to switch | Processing: {queue_size} queued, {output_queue_size} ready")
+            self.last_buffer_log = current_time
+        
+        # Passthrough buffer disabled - not storing raw audio
+        # self.passthrough_buffer.extend(indata.copy())  # Disabled
         
         # Add input to buffer
         self.input_buffer.extend(indata.copy())
@@ -211,66 +461,145 @@ class VinylStripper:
                     self.input_buffer.popleft()
             
             # Queue for processing (non-blocking, drop if full)
-            # Only queue if we have room - prevents backing up
-            if self.processing_queue.qsize() < self.processing_queue.maxsize // 2:
+            # More aggressive queuing - keep processing pipeline busy
+            if self.processing_queue.qsize() < self.processing_queue.maxsize * 0.8:  # Even more aggressive
                 try:
                     self.processing_queue.put_nowait(chunk)
                 except queue.Full:
                     pass  # Skip this chunk if we're backed up
+            else:
+                # Queue is getting full - log warning occasionally
+                if self.processing_queue.qsize() == int(self.processing_queue.maxsize * 0.8):
+                    logger.debug(f"Processing queue at {self.processing_queue.qsize()}/{self.processing_queue.maxsize}")
         
         # Try to get processed audio for output
-        # Keep filling buffer until we have enough for smooth playback
-        target_buffer_size = int(self.sample_rate * 10.0)  # Target 10 second buffer for safety
-        while self.output_buffer.shape[0] < target_buffer_size:
+        # Keep filling buffer aggressively to prevent skipping
+        target_buffer_size = int(self.sample_rate * 15.0)  # 15 second target buffer for more headroom
+        
+        # Always try to fill buffer if we have processed chunks available
+        # Process multiple chunks per callback to keep buffer full
+        chunks_added = 0
+        max_chunks_per_callback = 10  # Increased to fill buffer faster
+        while chunks_added < max_chunks_per_callback:
             try:
                 processed = self.output_queue.get_nowait()
-                # Only use hop_samples (non-overlapping portion) to prevent overlap artifacts
-                # This is the amount of new audio in each chunk
-                hop_portion = processed[:self.hop_samples]
-                self.output_buffer = np.vstack([self.output_buffer, hop_portion]) if self.output_buffer.shape[0] > 0 else hop_portion
+                
+                # Handle overlap correctly - only add non-overlapping portion to prevent gaps
+                if self.output_buffer.shape[0] > 0:
+                    # Skip overlap samples - only add new audio
+                    hop_portion = processed[self.overlap_samples:]
+                    if hop_portion.shape[0] > 0:
+                        self.output_buffer = np.vstack([self.output_buffer, hop_portion])
+                else:
+                    # First chunk - add entire chunk
+                    self.output_buffer = processed
+                
+                chunks_added += 1
                 if self.buffer_filling and self.output_buffer.shape[0] >= target_buffer_size:
                     self.buffer_filling = False
-                    self.use_passthrough = False
-                    print(f"✓ Buffer ready ({self.output_buffer.shape[0] / self.sample_rate:.1f}s)")
+                    logger.info(f"✓ Buffer ready: {self.output_buffer.shape[0] / self.sample_rate:.1f}s")
             except queue.Empty:
                 break
         
-        # Check if we need to switch to passthrough mode
-        # Use a higher threshold to prevent premature switching
-        if self.output_buffer.shape[0] < int(self.sample_rate * 1.5) and not self.buffer_filling:
-            # Buffer is getting low - switch to passthrough temporarily
-            if not self.use_passthrough:
-                self.use_passthrough = True
-                print("⚠ Passthrough mode")
+        # Passthrough mode is disabled - only use processed audio
+        # Log buffer status for monitoring
+        current_buffer_seconds = self.output_buffer.shape[0] / self.sample_rate
+        min_buffer_seconds = self.min_buffer_before_switch / self.sample_rate
         
-        # Output what we have
-        if self.output_buffer.shape[0] >= frames and not self.use_passthrough:
-            # Use processed audio
+        if self.buffer_filling and self.output_buffer.shape[0] >= self.min_buffer_before_switch:
+            # Buffer is ready
+            self.buffer_filling = False
+            logger.info(f"✓ Buffer ready ({current_buffer_seconds:.1f}s >= {min_buffer_seconds:.1f}s)")
+        elif self.buffer_filling:
+            # Still filling - log progress occasionally
+            if int(current_buffer_seconds) % 2 == 0 and current_buffer_seconds > 0:
+                logger.debug(f"Buffer filling: {current_buffer_seconds:.1f}s / {min_buffer_seconds:.1f}s (processing queue: {self.processing_queue.qsize()}, output queue: {self.output_queue.qsize()})")
+        
+        # Output only processed audio (passthrough disabled)
+        # Check buffer level before outputting
+        buffer_seconds = self.output_buffer.shape[0] / self.sample_rate
+        min_safe_buffer = 3.0  # Minimum safe buffer in seconds (increased)
+        
+        if self.output_buffer.shape[0] >= frames:
+            # Use processed audio - ensure continuous output
             outdata[:] = self.output_buffer[:frames]
             self.output_buffer = self.output_buffer[frames:]
-            # If buffer recovered, switch back to processed mode
-            if self.output_buffer.shape[0] >= target_buffer_size:
-                self.use_passthrough = False
-        elif self.use_passthrough and len(self.passthrough_buffer) >= frames:
-            # Passthrough mode - output raw audio (better than silence)
-            passthrough_data = np.array(list(self.passthrough_buffer)[:frames])
-            outdata[:] = passthrough_data
-            # Remove used samples from passthrough buffer
-            for _ in range(frames):
-                if self.passthrough_buffer:
-                    self.passthrough_buffer.popleft()
-        else:
-            # Not enough processed audio - repeat last sample or pad with zeros
-            if self.output_buffer.shape[0] > 0:
-                # Repeat last samples to avoid complete silence
-                last_samples = self.output_buffer[-1:]
-                padding_needed = frames - self.output_buffer.shape[0]
-                padding = np.tile(last_samples, (padding_needed, 1))
-                outdata[:] = np.vstack([self.output_buffer, padding])
-                self.output_buffer = np.zeros((0, 2), dtype=np.float32)
+            
+            # Log if buffer is getting low (but not every time to avoid spam)
+            new_buffer_seconds = self.output_buffer.shape[0] / self.sample_rate
+            if new_buffer_seconds < min_safe_buffer and not self.buffer_filling:
+                if not hasattr(self, '_last_low_buffer_log') or (time_module.time() - self._last_low_buffer_log) > 1.0:
+                    logger.warning(f"⚠ Buffer low: {new_buffer_seconds:.2f}s remaining (processing: {self.processing_queue.qsize()} queued, {self.output_queue.qsize()} ready)")
+                    self._last_low_buffer_log = time_module.time()
+        elif self.output_buffer.shape[0] > 0:
+            # Partial buffer - use what we have and smoothly fade/extend
+            available = self.output_buffer.shape[0]
+            outdata[:available] = self.output_buffer
+            # Crossfade/extend last samples to avoid clicks
+            if available >= 100:  # If we have enough samples, fade out
+                fade_length = min(100, available)
+                fade_curve = np.linspace(1.0, 0.0, fade_length).reshape(-1, 1)
+                outdata[available-fade_length:available] = self.output_buffer[-fade_length:] * fade_curve
             else:
-                # Complete silence - buffer underrun (shouldn't happen with passthrough)
-                outdata[:] = 0
+                # Repeat last sample smoothly
+                last_sample = self.output_buffer[-1:]
+                outdata[available:] = last_sample
+            self.output_buffer = np.zeros((0, 2), dtype=np.float32)
+            if not hasattr(self, '_last_underrun_log') or (time_module.time() - self._last_underrun_log) > 1.0:
+                logger.warning(f"⚠ Buffer underrun - partial output ({buffer_seconds:.2f}s available, need {frames/self.sample_rate:.2f}s)")
+                self._last_underrun_log = time_module.time()
+        else:
+            # No processed audio available - output silence (will cause skipping)
+            outdata[:] = 0
+            if not self.buffer_filling:
+                # Only log occasionally to avoid spam
+                if not hasattr(self, '_last_silence_log') or (time_module.time() - self._last_silence_log) > 2.0:
+                    logger.warning(f"⚠ No processed audio - skipping (processing: {self.processing_queue.qsize()} queued, {self.output_queue.qsize()} ready)")
+                    self._last_silence_log = time_module.time()
+
+    def prefill_buffer(self, duration=10.0):
+        """Pre-fill output buffer before starting playback to prevent dropouts."""
+        logger.info(f"Pre-filling buffer ({duration}s of audio)...")
+        
+        try:
+            # Record audio for pre-fill duration
+            prefill_samples = int(duration * self.sample_rate)
+            prefill_audio = sd.rec(
+                frames=prefill_samples,
+                samplerate=self.sample_rate,
+                channels=2,
+                device=self.input_device,
+                dtype=np.float32
+            )
+            sd.wait()
+            
+            # Process the pre-fill audio in chunks
+            chunks_to_process = []
+            for i in range(0, len(prefill_audio), self.chunk_samples):
+                chunk = prefill_audio[i:i+self.chunk_samples]
+                if len(chunk) == self.chunk_samples:
+                    chunks_to_process.append(chunk)
+            
+            logger.info(f"Processing {len(chunks_to_process)} pre-fill chunks...")
+            
+            # Process chunks and fill buffer
+            processed_count = 0
+            for chunk in chunks_to_process:
+                try:
+                    processed = self.process_chunk(chunk)
+                    hop_portion = processed[:self.hop_samples]
+                    self.output_buffer = np.vstack([self.output_buffer, hop_portion]) if self.output_buffer.shape[0] > 0 else hop_portion
+                    processed_count += 1
+                    if processed_count % 5 == 0:
+                        buffer_seconds = self.output_buffer.shape[0] / self.sample_rate
+                        logger.info(f"  Processed {processed_count}/{len(chunks_to_process)} chunks ({buffer_seconds:.1f}s buffer)")
+                except Exception as e:
+                    logger.warning(f"Error processing pre-fill chunk: {e}")
+            
+            buffer_seconds = self.output_buffer.shape[0] / self.sample_rate
+            logger.info(f"✓ Pre-fill complete: {buffer_seconds:.1f}s buffer ready")
+        except Exception as e:
+            logger.warning(f"Pre-fill failed: {e}. Will start with empty buffer.")
 
     def run(self):
         """Start the real-time processing."""
@@ -280,7 +609,11 @@ class VinylStripper:
         process_thread = threading.Thread(target=self.processing_worker, daemon=True)
         process_thread.start()
         
-        print("Starting audio stream... Press Ctrl+C to stop\n")
+        logger.info("Starting audio stream...")
+        logger.info("Note: Only processed audio will be played (passthrough disabled)")
+        logger.info("Audio will be silent until buffer is ready")
+        
+        logger.info("Press Ctrl+C to stop")
         
         try:
             with sd.Stream(
@@ -295,7 +628,7 @@ class VinylStripper:
                 while self.running:
                     sd.sleep(100)
         except KeyboardInterrupt:
-            print("\nStopping...")
+            logger.info("Stopping...")
         finally:
             self.running = False
             self.processing_queue.put(None)
@@ -495,8 +828,8 @@ Available stems: vocals, drums, bass, other
     parser.add_argument(
         "--chunk",
         type=float,
-        default=5.0,
-        help="Chunk duration in seconds (default: 5.0)"
+        default=2.5,
+        help="Chunk duration in seconds (default: 2.5, balanced for efficiency and latency)"
     )
     parser.add_argument(
         "--model",
@@ -567,14 +900,29 @@ Available stems: vocals, drums, bass, other
         remove_stems = args.remove
     
     # Create and run
-    stripper = VinylStripper(
-        input_device=args.input,
-        output_device=args.output,
-        remove_stems=remove_stems,
-        chunk_duration=args.chunk,
-        model_name=args.model,
-    )
-    stripper.run()
+    try:
+        stripper = VinylStripper(
+            input_device=args.input,
+            output_device=args.output,
+            remove_stems=remove_stems,
+            chunk_duration=args.chunk,
+            model_name=args.model,
+        )
+        stripper.run()
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+        sys.exit(0)
+    except MemoryError as e:
+        logger.error(f"Out of memory error: {e}")
+        log_memory_status("final OOM")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        logger.error(f"Traceback:\n{traceback.format_exc()}")
+        sys.exit(1)
+    finally:
+        # Ensure logs are flushed
+        logging.shutdown()
 
 
 if __name__ == "__main__":
