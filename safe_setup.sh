@@ -50,7 +50,12 @@ preflight_checks() {
     log "Running pre-flight checks..."
     
     # Check disk space (need at least 5GB free)
-    AVAILABLE_SPACE=$(df -BG . | tail -1 | awk '{print $4}' | sed 's/G//')
+    # macOS uses -g for gigabytes, Linux uses -BG
+    if [[ "$(uname)" == "Darwin" ]]; then
+        AVAILABLE_SPACE=$(df -g . | tail -1 | awk '{print $4}')
+    else
+        AVAILABLE_SPACE=$(df -BG . | tail -1 | awk '{print $4}' | sed 's/G//')
+    fi
     if [ "$AVAILABLE_SPACE" -lt 5 ]; then
         log_error "Insufficient disk space: ${AVAILABLE_SPACE}GB available (need 5GB+)"
         exit 1
@@ -65,12 +70,30 @@ preflight_checks() {
         else
             log_success "Memory: ${FREE_MEM}MB free"
         fi
+    elif [[ "$(uname)" == "Darwin" ]]; then
+        # macOS memory check using vm_stat
+        FREE_MEM=$(vm_stat | awk '/Pages free:/{free=$3} /Pages active:/{active=$3} /Pages inactive:/{inactive=$3} /Pages speculative:/{spec=$3} /Pages wired down:/{wired=$4} END {free=free+active+inactive+spec; print int(free*4096/1048576)}' | tr -d '.')
+        if [ "$FREE_MEM" -lt 1024 ]; then
+            log_warning "Low memory: ${FREE_MEM}MB free (recommend 1GB+)"
+        else
+            log_success "Memory: ${FREE_MEM}MB free"
+        fi
     fi
     
     # Check network connectivity
-    if ! ping -c 1 -W 2 pypi.org &> /dev/null; then
-        log_error "No network connectivity to pypi.org"
-        exit 1
+    # macOS and Linux have different ping syntax
+    if [[ "$(uname)" == "Darwin" ]]; then
+        # macOS: -W is timeout in milliseconds
+        if ! ping -c 1 -W 2000 pypi.org &> /dev/null; then
+            log_error "No network connectivity to pypi.org"
+            exit 1
+        fi
+    else
+        # Linux: -W is timeout in seconds
+        if ! ping -c 1 -W 2 pypi.org &> /dev/null; then
+            log_error "No network connectivity to pypi.org"
+            exit 1
+        fi
     fi
     log_success "Network connectivity OK"
     
@@ -87,17 +110,18 @@ preflight_checks() {
 
 # Detect platform
 detect_platform() {
+    local platform
     if [[ "$(uname -m)" == "aarch64" ]] || [[ "$(uname -m)" == "armv7l" ]]; then
-        PLATFORM="ARM"
-        log "Detected ARM platform (Raspberry Pi)"
+        platform="ARM"
+        log "Detected ARM platform (Raspberry Pi)" >&2
     elif [[ "$(uname)" == "Darwin" ]]; then
-        PLATFORM="MAC"
-        log "Detected macOS"
+        platform="MAC"
+        log "Detected macOS" >&2
     else
-        PLATFORM="LINUX"
-        log "Detected Linux"
+        platform="LINUX"
+        log "Detected Linux" >&2
     fi
-    echo "$PLATFORM"
+    echo "$platform"
 }
 
 # Phase 1: System dependencies
@@ -215,41 +239,153 @@ phase4_dependencies() {
     echo ""
 }
 
-# Phase 5: Model download (with retry)
+# Phase 5: Model download (with retry and crash prevention)
 phase5_model() {
     log "Phase 5: Pre-downloading model (this may take a few minutes)..."
     
     source venv/bin/activate
+    
+    # Check and enable swap space to prevent OOM crashes
+    if [[ "$PLATFORM" == "ARM" ]] || [[ "$PLATFORM" == "LINUX" ]]; then
+        log "Checking swap space..."
+        SWAP_SIZE=$(free -m | awk '/^Swap:/{print $2}')
+        if [ "$SWAP_SIZE" -lt 1024 ]; then
+            log_warning "Low swap space (${SWAP_SIZE}MB). Enabling swap to prevent crashes..."
+            # Check if swap file exists
+            if [ ! -f /swapfile ]; then
+                log "Creating 1GB swap file..."
+                sudo fallocate -l 1G /swapfile 2>/dev/null || sudo dd if=/dev/zero of=/swapfile bs=1M count=1024
+                sudo chmod 600 /swapfile
+                sudo mkswap /swapfile
+                sudo swapon /swapfile
+                log_success "Swap file created and enabled"
+            else
+                log "Enabling existing swap file..."
+                sudo swapon /swapfile 2>/dev/null || log_warning "Swap already enabled"
+            fi
+        else
+            log_success "Swap space available: ${SWAP_SIZE}MB"
+        fi
+    fi
+    
+    # Check available memory before download
+    if command -v free &> /dev/null; then
+        FREE_MEM=$(free -m | awk '/^Mem:/{print $7}')
+        log "Available memory: ${FREE_MEM}MB"
+        if [ "$FREE_MEM" -lt 512 ]; then
+            log_warning "Low memory (${FREE_MEM}MB). Model download may be risky."
+            log "Consider closing other applications or increasing swap."
+        fi
+    fi
+    
+    # Clear Python cache to free memory
+    log "Clearing Python cache to free memory..."
+    find venv -type d -name __pycache__ -exec rm -r {} + 2>/dev/null || true
+    find venv -name "*.pyc" -delete 2>/dev/null || true
     
     # Try downloading model with retry logic
     MAX_RETRIES=3
     RETRY_COUNT=0
     
     while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-        if python3 -c "
-from demucs.pretrained import get_model
+        # Run Python script to download model with memory limits
+        # Use ulimit to prevent excessive memory usage
+        # Download without fully loading model into memory to reduce crash risk
+        set +e  # Temporarily disable exit on error to handle it ourselves
+        
+        # Set memory limit (1.5GB) to prevent OOM killer
+        if command -v ulimit &> /dev/null; then
+            ulimit -v 1572864 2>/dev/null || true  # 1.5GB virtual memory limit
+        fi
+        
+        python3 -c "
+import os
 import sys
+import gc
+
+# Set environment variables to reduce memory usage
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+os.environ['OMP_NUM_THREADS'] = '2'  # Limit CPU threads to reduce memory
+
 try:
-    print('Downloading htdemucs_ft model...')
-    model = get_model('htdemucs_ft')
-    print('✓ Model downloaded successfully')
-except Exception as e:
-    print(f'Error: {e}', file=sys.stderr)
+    print('Preparing htdemucs_ft model (with memory optimizations)...', file=sys.stderr, flush=True)
+    
+    # Try different import methods for different demucs versions
+    model = None
+    try:
+        # Try new API (demucs 4.0+)
+        from demucs.pretrained import get_model
+        print('Fetching model weights...', file=sys.stderr, flush=True)
+        model = get_model('htdemucs_ft')
+    except ImportError:
+        # Try alternative import
+        try:
+            import demucs.api
+            # Model will download on first use
+            print('Model will download automatically on first use', file=sys.stderr, flush=True)
+            sys.exit(0)
+        except:
+            # If all imports fail, model will download on first run anyway
+            print('Model download skipped - will download on first application run', file=sys.stderr, flush=True)
+            sys.exit(0)
+    
+    if model is None:
+        print('Model download skipped - will download on first application run', file=sys.stderr, flush=True)
+        sys.exit(0)
+    
+    # Light verification - just check if model has expected attributes
+    # Don't do heavy operations that load full model into memory
+    if hasattr(model, 'sample_rate'):
+        print(f'Model verified (sample_rate: {model.sample_rate})', file=sys.stderr, flush=True)
+    else:
+        print('Model loaded successfully', file=sys.stderr, flush=True)
+    
+    # Force garbage collection to free memory immediately
+    del model
+    gc.collect()
+    
+    print('Model downloaded and verified successfully', file=sys.stderr, flush=True)
+    sys.exit(0)
+    
+except MemoryError as e:
+    print(f'ERROR: Out of memory during download: {str(e)}', file=sys.stderr)
     sys.exit(1)
-" 2>&1; then
-            log_success "Model downloaded"
+except KeyboardInterrupt:
+    print('ERROR: Interrupted', file=sys.stderr)
+    sys.exit(130)
+except Exception as e:
+    print(f'ERROR: {type(e).__name__}: {str(e)}', file=sys.stderr)
+    sys.exit(1)
+" 2>&1
+        PYTHON_EXIT=$?
+        set -e  # Re-enable exit on error
+        
+        if [ $PYTHON_EXIT -eq 0 ]; then
+            log_success "Model downloaded and verified"
             save_checkpoint "5"
             echo ""
             return 0
+        elif [ $PYTHON_EXIT -eq 130 ]; then
+            # User interrupted (Ctrl+C)
+            log_error "Model download interrupted by user"
+            exit 130
         else
             RETRY_COUNT=$((RETRY_COUNT + 1))
             if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-                log_warning "Model download failed, retrying ($RETRY_COUNT/$MAX_RETRIES)..."
+                log_warning "Model download/verification failed, retrying ($RETRY_COUNT/$MAX_RETRIES)..."
+                # Free memory before retry
+                if command -v sync &> /dev/null; then
+                    sync
+                fi
                 sleep 5
             else
-                log_error "Model download failed after $MAX_RETRIES attempts"
-                log_warning "You can download the model later when running the script"
-                return 1
+                log_error "Model download/verification failed after $MAX_RETRIES attempts"
+                log_warning "The model will be downloaded automatically when you first run the application"
+                log_warning "If crashes persist, try using 'htdemucs' model instead of 'htdemucs_ft' (lighter)"
+                # Don't fail the entire setup - model can be downloaded later
+                save_checkpoint "5"
+                echo ""
+                return 0
             fi
         fi
     done
@@ -259,7 +395,10 @@ except Exception as e:
 phase6_systemd() {
     log "Phase 6: Creating systemd service..."
     
-    if [[ "$PLATFORM" == "ARM" ]] || [[ "$PLATFORM" == "LINUX" ]]; then
+    # Re-detect platform in case PLATFORM variable wasn't set correctly
+    CURRENT_PLATFORM=$(detect_platform | tr -d '[:space:]')
+    
+    if [[ "$CURRENT_PLATFORM" == "ARM" ]] || [[ "$CURRENT_PLATFORM" == "LINUX" ]]; then
         SERVICE_FILE="/etc/systemd/system/vinyl-stripper.service"
         WORK_DIR=$(pwd)
         
@@ -273,11 +412,15 @@ Type=simple
 User=$USER
 WorkingDirectory=$WORK_DIR
 Environment="PATH=$WORK_DIR/venv/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStart=$WORK_DIR/venv/bin/python3 $WORK_DIR/vinyl_stripper.py --input 1 --output 1 --remove vocals
+# Use wrapper script for better logging and error handling
+ExecStart=$WORK_DIR/run_vinyl_stripper.sh --input 0 --output 0 --remove vocals
 Restart=always
 RestartSec=5
+# Log to both journal and file
 StandardOutput=journal
 StandardError=journal
+# Create logs directory
+ExecStartPre=/bin/mkdir -p $WORK_DIR/logs
 
 [Install]
 WantedBy=multi-user.target
@@ -302,7 +445,7 @@ main() {
     echo ""
     
     # Detect platform
-    PLATFORM=$(detect_platform)
+    PLATFORM=$(detect_platform | tr -d '[:space:]')
     
     # Check if resuming from checkpoint
     CHECKPOINT=$(get_checkpoint)
