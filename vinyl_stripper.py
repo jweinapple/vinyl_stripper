@@ -131,10 +131,10 @@ def log_memory_status(stage=""):
 class VinylStripper:
     def __init__(
         self,
-        input_device: int,
-        output_device: int,
+        input_device: int | str,  # Can be device index (int) or ALSA string (str)
+        output_device: int | str,  # Can be device index (int) or ALSA string (str)
         remove_stems: list[str],
-        chunk_duration: float = 0.25,  # seconds per chunk (very small for fastest processing)
+        chunk_duration: float = 0.20,  # seconds per chunk (very small for fastest processing)
         overlap: float = 0.03,  # overlap for smoother transitions (increased to prevent gaps)
         sample_rate: int = 44100,
         model_name: str = None,  # Model name (default: htdemucs_ft)
@@ -153,16 +153,15 @@ class VinylStripper:
         self.hop_samples = self.chunk_samples - self.overlap_samples
         
         self.input_buffer = deque(maxlen=self.chunk_samples * 16)
-        self.output_queue = queue.Queue(maxsize=100)  # Increased buffer size
+        self.output_queue = queue.Queue(maxsize=50)
         self.output_buffer = np.zeros((0, 2), dtype=np.float32)
-        self.passthrough_buffer = deque(maxlen=int(sample_rate * 5))  # Increased passthrough buffer
-        self.processing_queue = queue.Queue(maxsize=30)  # Increased processing queue
+        self.passthrough_buffer = deque(maxlen=int(sample_rate * 3))
+        self.processing_queue = queue.Queue(maxsize=20)
         self.running = False
         self.buffer_filling = True
-        self.use_passthrough = False  # Disabled - only play processed audio
+        self.use_passthrough = False
         self.last_buffer_log = 0
         self.buffer_log_interval = 5.0  # Log buffer status every 5 seconds
-        self.min_buffer_before_switch = int(sample_rate * 3.0)  # Need at least 3s before switching from passthrough (reduced from 5s)
         
         # Load model with device-specific optimization
         # Reference torch before any local imports to avoid UnboundLocalError
@@ -264,169 +263,53 @@ class VinylStripper:
         
         # Normalize
         ref = audio_tensor.mean(0)
-        ref_std = ref.std()
-        # Avoid division by zero
-        if ref_std < 1e-8:
-            ref_std = torch.tensor(1.0, device=self.device)
-        audio_tensor = (audio_tensor - ref.mean()) / ref_std
+        audio_tensor = (audio_tensor - ref.mean()) / ref.std()
         
-        try:
-            with torch.no_grad():
-                # Apply model - returns (batch, stems, channels, samples)
-                # Optimized for longer chunks and better memory management
-                chunk_length = audio_tensor.shape[-1]
-                chunk_duration = chunk_length / self.sample_rate
-                
-                # Configure segment size based on device and chunk size
-                # For CPU, use larger segments to process more audio at once
-                # For CUDA, can process entire chunk
-                if self.device == "cuda":
-                    # GPU can handle larger chunks
-                    segment_size = None  # Process entire chunk
-                    use_split = False
-                else:
-                    # CPU: Use larger segments for better throughput
-                    # Process in 4-8 second segments for better efficiency
-                    if chunk_duration <= 4.0:
-                        # Small chunk - process whole thing
-                        segment_size = None
-                        use_split = False
-                    else:
-                        # Larger chunk - use 6 second segments
-                        segment_size = int(self.sample_rate * 6.0)  # 6 second segments
-                        use_split = True
-                
-                logger.debug(f"Processing chunk: {chunk_duration:.2f}s, segment={segment_size}, split={use_split}, device={self.device}")
-                
-                sources = apply_model(
-                    self.model, 
-                    audio_tensor, 
-                    device=self.device,
-                    segment=segment_size,  # None for whole chunk, or segment size
-                    split=use_split,  # Enable splitting for large chunks
-                    shifts=1,  # Single shift for speed
-                    overlap=0.25,  # Small overlap for smoother transitions
-                    progress=False,  # Disable progress bar
-                )
-                
-                logger.debug(f"Model returned sources: shape={sources.shape}")
-        except Exception as e:
-            logger.error(f"Error in apply_model: {type(e).__name__}: {e}")
-            logger.error(f"Traceback:\n{traceback.format_exc()}")
-            raise
+        with torch.no_grad():
+            # Apply model - returns (batch, stems, channels, samples)
+            # Use simpler approach for small chunks (like reference)
+            sources = apply_model(
+                self.model, 
+                audio_tensor, 
+                device=self.device,
+                segment=None,  # Process entire chunk at once (faster for small chunks)
+                split=False,  # Disable splitting for speed (we're already chunking)
+                shifts=1,  # Single shift for speed (default is 1)
+                overlap=0.0,  # No overlap needed since we handle it in chunking
+            )
         
         # sources shape: (1, 4, 2, samples)
         # stems are: drums, bass, other, vocals
         
-        # Debug: Check if we're getting valid output from model
-        if sources.shape[1] != 4:
-            logger.error(f"Unexpected number of stems: {sources.shape[1]} (expected 4)")
-        
         # Sum all stems except the ones we want to remove
         output = torch.zeros_like(audio_tensor)
-        stems_kept = []
-        stems_removed = []
         for stem_name, idx in self.stem_indices.items():
             if stem_name not in self.remove_stems:
                 output += sources[0, idx]
-                stems_kept.append(stem_name)
-            else:
-                stems_removed.append(stem_name)
         
-        # Debug logging (first chunk only)
-        if not hasattr(self, '_logged_first_chunk'):
-            logger.info(f"Processing first chunk: Keeping {stems_kept}, Removing {stems_removed}")
-            logger.info(f"Output shape: {output.shape}, Mean: {output.mean().item():.6f}, Std: {output.std().item():.6f}")
-            logger.info(f"Sources stats - Drums: {sources[0, 0].mean().item():.6f}, Bass: {sources[0, 1].mean().item():.6f}, Other: {sources[0, 2].mean().item():.6f}, Vocals: {sources[0, 3].mean().item():.6f}")
-            self._logged_first_chunk = True
-        
-        # Denormalize - use original reference stats
-        ref_std = ref.std()
-        ref_mean = ref.mean()
-        # Avoid division by zero in denormalization
-        if ref_std < 1e-8:
-            ref_std = torch.tensor(1.0, device=self.device)
-        
-        output = output * ref_std + ref_mean
-        
-        # Check for silence (all zeros or very quiet) - only log first time
-        if not hasattr(self, '_checked_silence'):
-            output_std = output.std().item()
-            output_mean = output.mean().item()
-            logger.info(f"Output stats after denormalization: Mean={output_mean:.6f}, Std={output_std:.6f}")
-            if output_std < 1e-6:
-                logger.warning(f"⚠ Output is very quiet (std: {output_std:.2e}) - possible processing issue")
-            self._checked_silence = True
+        # Denormalize
+        output = output * ref.std() + ref.mean()
         
         # Convert back to numpy (samples, channels)
-        result = output.squeeze(0).T.cpu().numpy()
-        
-        # Final check - ensure we have valid audio
-        if np.allclose(result, 0, atol=1e-6):
-            logger.error("⚠ Output is all zeros - processing failed!")
-        
-        return result
+        return output.squeeze(0).T.cpu().numpy()
 
     def processing_worker(self):
         """Background thread that processes audio chunks."""
-        chunks_processed = 0
-        chunks_failed = 0
-        import time as time_module
-        
-        logger.info("Processing worker started")
         while self.running:
             try:
                 chunk = self.processing_queue.get(timeout=0.5)
             except queue.Empty:
-                # Log if queue is backing up
-                queue_size = self.processing_queue.qsize()
-                if queue_size > 10 and chunks_processed == 0:
-                    logger.warning(f"⚠ Processing queue backing up ({queue_size} queued) but no chunks processed yet - worker may be stuck")
                 continue
             
             if chunk is None:
                 break
                 
             try:
-                # Time the processing to see how long it takes
-                start_time = time_module.time()
-                logger.debug(f"Starting to process chunk (queue size: {self.processing_queue.qsize()})")
-                
                 processed = self.process_chunk(chunk)
-                processing_time = time_module.time() - start_time
-                
-                # Check if output is valid
-                if processed is None or processed.size == 0:
-                    logger.error(f"⚠ Processed chunk is None or empty!")
-                    chunks_failed += 1
-                    continue
-                
                 self.output_queue.put(processed)
-                chunks_processed += 1
-                
-                # Log first few chunks and then periodically
-                if chunks_processed <= 5 or chunks_processed % 5 == 0:
-                    chunk_duration = len(chunk) / self.sample_rate
-                    realtime_factor = chunk_duration / processing_time if processing_time > 0 else 0
-                    logger.info(f"✓ Processed chunk {chunks_processed}: {processing_time:.2f}s for {chunk_duration:.2f}s audio (RTF: {realtime_factor:.2f}x)")
-                    if realtime_factor < 1.0:
-                        logger.warning(f"⚠ Processing slower than real-time! Need {1.0/realtime_factor:.1f}x speedup")
-                
-                if chunks_processed % 10 == 0:
-                    logger.debug(f"Processed {chunks_processed} chunks (output queue: {self.output_queue.qsize()}, failed: {chunks_failed})")
-            except KeyboardInterrupt:
-                logger.info("Processing worker interrupted")
-                break
             except Exception as e:
-                chunks_failed += 1
-                logger.error(f"✗ Processing error on chunk {chunks_processed + chunks_failed}: {type(e).__name__}: {e}")
+                logger.error(f"Processing error: {e}")
                 logger.error(f"Traceback:\n{traceback.format_exc()}")
-                # Don't break - keep trying to process other chunks
-                if chunks_failed > 10:
-                    logger.error("Too many processing failures - stopping worker")
-                    break
-        
-        logger.info(f"Processing worker stopped (processed {chunks_processed} chunks, failed {chunks_failed})")
 
     def audio_callback(self, indata, outdata, frames, time, status):
         """Called by sounddevice for each audio block."""
@@ -441,12 +324,11 @@ class VinylStripper:
             queue_size = self.processing_queue.qsize()
             output_queue_size = self.output_queue.qsize()
             mode = "passthrough" if self.use_passthrough else "processed"
-            min_needed = self.min_buffer_before_switch / self.sample_rate
-            logger.info(f"Buffer status: {buffer_seconds:.1f}s ({mode}), need {min_needed:.1f}s to switch | Processing: {queue_size} queued, {output_queue_size} ready")
+            logger.info(f"Buffer status: {buffer_seconds:.1f}s ({mode}) | Processing: {queue_size} queued, {output_queue_size} ready")
             self.last_buffer_log = current_time
         
-        # Passthrough buffer disabled - not storing raw audio
-        # self.passthrough_buffer.extend(indata.copy())  # Disabled
+        # Store raw audio for passthrough fallback
+        self.passthrough_buffer.extend(indata.copy())
         
         # Add input to buffer
         self.input_buffer.extend(indata.copy())
@@ -461,101 +343,66 @@ class VinylStripper:
                     self.input_buffer.popleft()
             
             # Queue for processing (non-blocking, drop if full)
-            # More aggressive queuing - keep processing pipeline busy
-            if self.processing_queue.qsize() < self.processing_queue.maxsize * 0.8:  # Even more aggressive
+            # Only queue if we have room - prevents backing up
+            if self.processing_queue.qsize() < self.processing_queue.maxsize // 2:
                 try:
                     self.processing_queue.put_nowait(chunk)
                 except queue.Full:
                     pass  # Skip this chunk if we're backed up
-            else:
-                # Queue is getting full - log warning occasionally
-                if self.processing_queue.qsize() == int(self.processing_queue.maxsize * 0.8):
-                    logger.debug(f"Processing queue at {self.processing_queue.qsize()}/{self.processing_queue.maxsize}")
         
         # Try to get processed audio for output
-        # Keep filling buffer aggressively to prevent skipping
-        target_buffer_size = int(self.sample_rate * 15.0)  # 15 second target buffer for more headroom
-        
-        # Always try to fill buffer if we have processed chunks available
-        # Process multiple chunks per callback to keep buffer full
-        chunks_added = 0
-        max_chunks_per_callback = 10  # Increased to fill buffer faster
-        while chunks_added < max_chunks_per_callback:
+        # Keep filling buffer until we have enough for smooth playback
+        target_buffer_size = int(self.sample_rate * 10.0)  # Target 10 second buffer for safety
+        while self.output_buffer.shape[0] < target_buffer_size:
             try:
                 processed = self.output_queue.get_nowait()
-                
-                # Handle overlap correctly - only add non-overlapping portion to prevent gaps
-                if self.output_buffer.shape[0] > 0:
-                    # Skip overlap samples - only add new audio
-                    hop_portion = processed[self.overlap_samples:]
-                    if hop_portion.shape[0] > 0:
-                        self.output_buffer = np.vstack([self.output_buffer, hop_portion])
-                else:
-                    # First chunk - add entire chunk
-                    self.output_buffer = processed
-                
-                chunks_added += 1
+                # Only use hop_samples (non-overlapping portion) to prevent overlap artifacts
+                # This is the amount of new audio in each chunk
+                hop_portion = processed[:self.hop_samples]
+                self.output_buffer = np.vstack([self.output_buffer, hop_portion]) if self.output_buffer.shape[0] > 0 else hop_portion
                 if self.buffer_filling and self.output_buffer.shape[0] >= target_buffer_size:
                     self.buffer_filling = False
-                    logger.info(f"✓ Buffer ready: {self.output_buffer.shape[0] / self.sample_rate:.1f}s")
+                    self.use_passthrough = False
+                    logger.info(f"✓ Buffer ready ({self.output_buffer.shape[0] / self.sample_rate:.1f}s)")
             except queue.Empty:
                 break
         
-        # Passthrough mode is disabled - only use processed audio
-        # Log buffer status for monitoring
-        current_buffer_seconds = self.output_buffer.shape[0] / self.sample_rate
-        min_buffer_seconds = self.min_buffer_before_switch / self.sample_rate
+        # Check if we need to switch to passthrough mode
+        # Use a higher threshold to prevent premature switching
+        if self.output_buffer.shape[0] < int(self.sample_rate * 1.5) and not self.buffer_filling:
+            # Buffer is getting low - switch to passthrough temporarily
+            if not self.use_passthrough:
+                self.use_passthrough = True
+                logger.warning("⚠ Passthrough mode")
         
-        if self.buffer_filling and self.output_buffer.shape[0] >= self.min_buffer_before_switch:
-            # Buffer is ready
-            self.buffer_filling = False
-            logger.info(f"✓ Buffer ready ({current_buffer_seconds:.1f}s >= {min_buffer_seconds:.1f}s)")
-        elif self.buffer_filling:
-            # Still filling - log progress occasionally
-            if int(current_buffer_seconds) % 2 == 0 and current_buffer_seconds > 0:
-                logger.debug(f"Buffer filling: {current_buffer_seconds:.1f}s / {min_buffer_seconds:.1f}s (processing queue: {self.processing_queue.qsize()}, output queue: {self.output_queue.qsize()})")
-        
-        # Output only processed audio (passthrough disabled)
-        # Check buffer level before outputting
-        buffer_seconds = self.output_buffer.shape[0] / self.sample_rate
-        min_safe_buffer = 3.0  # Minimum safe buffer in seconds (increased)
-        
-        if self.output_buffer.shape[0] >= frames:
-            # Use processed audio - ensure continuous output
+        # Output what we have
+        if self.output_buffer.shape[0] >= frames and not self.use_passthrough:
+            # Use processed audio
             outdata[:] = self.output_buffer[:frames]
             self.output_buffer = self.output_buffer[frames:]
-            
-            # Log if buffer is getting low (but not every time to avoid spam)
-            new_buffer_seconds = self.output_buffer.shape[0] / self.sample_rate
-            if new_buffer_seconds < min_safe_buffer and not self.buffer_filling:
-                if not hasattr(self, '_last_low_buffer_log') or (time_module.time() - self._last_low_buffer_log) > 1.0:
-                    logger.warning(f"⚠ Buffer low: {new_buffer_seconds:.2f}s remaining (processing: {self.processing_queue.qsize()} queued, {self.output_queue.qsize()} ready)")
-                    self._last_low_buffer_log = time_module.time()
-        elif self.output_buffer.shape[0] > 0:
-            # Partial buffer - use what we have and smoothly fade/extend
-            available = self.output_buffer.shape[0]
-            outdata[:available] = self.output_buffer
-            # Crossfade/extend last samples to avoid clicks
-            if available >= 100:  # If we have enough samples, fade out
-                fade_length = min(100, available)
-                fade_curve = np.linspace(1.0, 0.0, fade_length).reshape(-1, 1)
-                outdata[available-fade_length:available] = self.output_buffer[-fade_length:] * fade_curve
-            else:
-                # Repeat last sample smoothly
-                last_sample = self.output_buffer[-1:]
-                outdata[available:] = last_sample
-            self.output_buffer = np.zeros((0, 2), dtype=np.float32)
-            if not hasattr(self, '_last_underrun_log') or (time_module.time() - self._last_underrun_log) > 1.0:
-                logger.warning(f"⚠ Buffer underrun - partial output ({buffer_seconds:.2f}s available, need {frames/self.sample_rate:.2f}s)")
-                self._last_underrun_log = time_module.time()
+            # If buffer recovered, switch back to processed mode
+            if self.output_buffer.shape[0] >= target_buffer_size:
+                self.use_passthrough = False
+        elif self.use_passthrough and len(self.passthrough_buffer) >= frames:
+            # Passthrough mode - output raw audio (better than silence)
+            passthrough_data = np.array(list(self.passthrough_buffer)[:frames])
+            outdata[:] = passthrough_data
+            # Remove used samples from passthrough buffer
+            for _ in range(frames):
+                if self.passthrough_buffer:
+                    self.passthrough_buffer.popleft()
         else:
-            # No processed audio available - output silence (will cause skipping)
-            outdata[:] = 0
-            if not self.buffer_filling:
-                # Only log occasionally to avoid spam
-                if not hasattr(self, '_last_silence_log') or (time_module.time() - self._last_silence_log) > 2.0:
-                    logger.warning(f"⚠ No processed audio - skipping (processing: {self.processing_queue.qsize()} queued, {self.output_queue.qsize()} ready)")
-                    self._last_silence_log = time_module.time()
+            # Not enough processed audio - repeat last sample or pad with zeros
+            if self.output_buffer.shape[0] > 0:
+                # Repeat last samples to avoid complete silence
+                last_samples = self.output_buffer[-1:]
+                padding_needed = frames - self.output_buffer.shape[0]
+                padding = np.tile(last_samples, (padding_needed, 1))
+                outdata[:] = np.vstack([self.output_buffer, padding])
+                self.output_buffer = np.zeros((0, 2), dtype=np.float32)
+            else:
+                # Complete silence - buffer underrun (shouldn't happen with passthrough)
+                outdata[:] = 0
 
     def prefill_buffer(self, duration=10.0):
         """Pre-fill output buffer before starting playback to prevent dropouts."""
@@ -609,22 +456,35 @@ class VinylStripper:
         process_thread = threading.Thread(target=self.processing_worker, daemon=True)
         process_thread.start()
         
-        logger.info("Starting audio stream...")
-        logger.info("Note: Only processed audio will be played (passthrough disabled)")
-        logger.info("Audio will be silent until buffer is ready")
-        
-        logger.info("Press Ctrl+C to stop")
+        logger.info("Starting audio stream... Press Ctrl+C to stop")
         
         try:
-            with sd.Stream(
-                device=(self.input_device, self.output_device),
-                samplerate=self.sample_rate,
-                channels=2,
-                dtype=np.float32,
-                blocksize=8192,
-                latency='high',
-                callback=self.audio_callback,
-            ):
+            # If device is an ALSA string, try to use ALSA host API
+            stream_kwargs = {
+                'samplerate': self.sample_rate,
+                'channels': 2,
+                'dtype': np.float32,
+                'blocksize': 8192,
+                'latency': 'high',
+                'callback': self.audio_callback,
+            }
+            
+            # Handle ALSA device strings by finding ALSA host API
+            if isinstance(self.input_device, str) or isinstance(self.output_device, str):
+                # Find ALSA host API
+                try:
+                    for i in range(sd.query_hostapis()):
+                        api = sd.query_hostapis(i)
+                        if 'alsa' in api['name'].lower():
+                            stream_kwargs['hostapi'] = i
+                            logger.info(f"Using ALSA host API: {api['name']}")
+                            break
+                except:
+                    pass
+            
+            stream_kwargs['device'] = (self.input_device, self.output_device)
+            
+            with sd.Stream(**stream_kwargs):
                 while self.running:
                     sd.sleep(100)
         except KeyboardInterrupt:
@@ -680,23 +540,71 @@ def find_soundid_reference_device():
 
 
 def find_usb_audio_device():
-    """Auto-detect USB audio interface (UCA202, etc.)."""
-    devices = sd.query_devices()
-    for i, device in enumerate(devices):
-        name = device['name'].lower()
-        # Look for USB audio devices (UCA202 shows as "USB Audio Device" in ALSA)
-        if ('usb audio' in name or 'uca202' in name or 'behringer' in name or 
-            'scarlett' in name or 'focusrite' in name):
-            # UCA202 has 2 in, 2 out
-            if device['max_input_channels'] >= 2 and device['max_output_channels'] >= 2:
-                return i
+    """Auto-detect USB audio interface (UCA202/UFO202, etc.)."""
+    # Try to enumerate devices first
+    try:
+        devices = sd.query_devices()
+    except:
+        devices = []
+    
+    # If devices found via PortAudio enumeration, check them
+    if len(devices) > 0:
+        for i, device in enumerate(devices):
+            name = device['name'].lower()
+            # Look for USB audio devices (UCA202/UFO202 shows as "USB Audio CODEC" or "USB Audio Device" in ALSA)
+            has_usb = 'usb' in name
+            has_codec = 'codec' in name
+            has_other = any(x in name for x in ['uca202', 'ufo202', 'behringer', 'scarlett', 'focusrite'])
+            
+            if (has_usb and has_codec) or has_usb or has_other:
+                # UCA202/UFO202 has 2 in, 2 out
+                if device['max_input_channels'] >= 2 and device['max_output_channels'] >= 2:
+                    return i
+    
+    # Fallback: PortAudio enumeration failed, try querying by index
+    # Check common USB audio device indices (0-10)
+    for i in range(11):
+        try:
+            device_info = sd.query_devices(i)
+            name = device_info['name'].lower()
+            # Look for USB audio devices - check for "usb" and "codec" separately
+            has_usb = 'usb' in name
+            has_codec = 'codec' in name
+            has_other = any(x in name for x in ['uca202', 'ufo202', 'behringer', 'scarlett', 'focusrite'])
+            
+            if (has_usb and has_codec) or has_usb or has_other:
+                if device_info['max_input_channels'] >= 2 and device_info['max_output_channels'] >= 2:
+                    return i
+        except:
+            continue
+    
+    # Final fallback: If PortAudio completely fails, use ALSA device string directly
+    # Parse arecord output to find USB Audio CODEC card number
+    try:
+        import subprocess
+        import re
+        # Check if USB audio device exists via arecord
+        result = subprocess.run(['arecord', '-l'], capture_output=True, text=True, timeout=2)
+        if 'USB Audio' in result.stdout or 'CODEC' in result.stdout:
+            # Parse card number from output: "card 2: CODEC [USB Audio CODEC]"
+            match = re.search(r'card (\d+):.*USB Audio.*CODEC', result.stdout)
+            if match:
+                card_num = match.group(1)
+                # When PortAudio fails, we can't use ALSA strings directly with sounddevice
+                # Instead, return a special marker that will trigger default device usage
+                # The card number is stored for potential ALSA configuration
+                return f"_alsa_card_{card_num}"
+    except Exception as e:
+        logger.debug(f"ALSA fallback failed: {e}")
+    
     return None
 
 
 def resolve_device(device_arg):
     """
-    Resolve device argument to device index.
-    Accepts: integer (device index), 'ua' (Universal Audio), 'sid' (SoundID), 'usb' (USB audio), or None (auto-detect).
+    Resolve device argument to device index or ALSA device string.
+    Accepts: integer (device index), ALSA string (e.g., 'hw:2,0'), 'ua' (Universal Audio), 'sid' (SoundID), 'usb' (USB audio), or None (auto-detect).
+    Returns: int (device index) or str (ALSA device string)
     """
     if device_arg is None:
         return None
@@ -705,14 +613,30 @@ def resolve_device(device_arg):
     if isinstance(device_arg, int):
         return device_arg
     
+    # If it's a string, check if it's an ALSA device string or numeric
+    if isinstance(device_arg, str):
+        # Check if it's an ALSA device string (starts with 'hw:' or 'plughw:')
+        if device_arg.startswith('hw:') or device_arg.startswith('plughw:'):
+            return device_arg
+        # Try to parse as integer if it's a numeric string
+        try:
+            return int(device_arg)
+        except (ValueError, TypeError):
+            pass  # Not numeric, continue to nickname checking
+    
     # Try to parse as integer
     try:
         return int(device_arg)
     except (ValueError, TypeError):
         pass
     
+    # Check if it's an ALSA device string
+    device_str = str(device_arg)
+    if device_str.startswith('hw:') or device_str.startswith('plughw:'):
+        return device_str
+    
     # Check for nicknames
-    device_str = str(device_arg).lower()
+    device_str = device_str.lower()
     
     if device_str == 'ua' or device_str == 'apollo':
         dev = find_universal_audio_device()
@@ -726,14 +650,14 @@ def resolve_device(device_arg):
             raise ValueError(f"SoundID Reference device not found. Use --list-devices to see available devices.")
         return dev
     
-    if device_str == 'usb':
+    if device_str == 'ufo202' or device_str == 'usb':
         dev = find_usb_audio_device()
         if dev is None:
-            raise ValueError(f"USB audio device not found. Use --list-devices to see available devices.")
+            raise ValueError(f"USB audio device (UFO202) not found. Use --list-devices to see available devices.")
         return dev
     
     # Unknown nickname
-    raise ValueError(f"Unknown device nickname: '{device_arg}'. Use integer index, 'ua', 'sid', 'usb', or --list-devices")
+    raise ValueError(f"Unknown device nickname: '{device_arg}'. Use integer index, ALSA string (hw:X,Y), 'ua', 'sid', 'usb', or --list-devices")
 
 
 
@@ -807,17 +731,18 @@ Examples:
     python3 vinyl_stripper.py --list-devices
     python3 vinyl_stripper.py --input 1 --output 1 --remove vocals
     python3 vinyl_stripper.py --input ua --output sid --remove vocals
+    python3 vinyl_stripper.py --input ufo202 --output ufo202 --remove vocals
     python3 vinyl_stripper.py --model htdemucs --remove vocals drums
     python3 vinyl_stripper.py --remove all
     
-Device nicknames: ua (Universal Audio), sid (SoundID Reference), usb (USB audio)
+Device nicknames: ua (Universal Audio), sid (SoundID Reference), ufo202 (UFO202/USB audio), usb (USB audio - alias for ufo202)
 Available models: htdemucs, htdemucs_ft (default), htdemucs_6s
 Available stems: vocals, drums, bass, other
         """
     )
     parser.add_argument("--list-devices", action="store_true", help="List audio devices and exit")
-    parser.add_argument("-i", "--input", type=str, help="Input device index or nickname (ua, sid, usb)")
-    parser.add_argument("-o", "--output", type=str, help="Output device index or nickname (ua, sid, usb)")
+    parser.add_argument("-i", "--input", type=str, help="Input device index or nickname (ua, sid, ufo202, usb)")
+    parser.add_argument("-o", "--output", type=str, help="Output device index or nickname (ua, sid, ufo202, usb)")
     parser.add_argument(
         "--remove",
         nargs="+",
@@ -858,30 +783,78 @@ Available stems: vocals, drums, bass, other
     if args.input is None or args.output is None:
         input_dev = None
         output_dev = None
+        device_detected = False  # Track if we successfully detected a device
         
-        # Try USB audio device (UCA202, etc.) first
+        # Get devices list for checking capabilities
+        devices = sd.query_devices()
+        
+        # Try USB audio device (UCA202/UFO202, etc.) first
         usb_device = find_usb_audio_device()
+        
+        # Note: find_usb_audio_device() now returns ALSA string if PortAudio fails
+        
         if usb_device is not None:
-            if devices[usb_device]['max_input_channels'] >= 2 and devices[usb_device]['max_output_channels'] >= 2:
+            # Check if usb_device is a special ALSA marker
+            if isinstance(usb_device, str) and usb_device.startswith("_alsa_card_"):
+                # PortAudio enumeration failed - use default device
+                # ALSA will use the default card, which should be the USB device if configured
+                input_dev = None  # Use default device
+                output_dev = None  # Use default device
+                device_detected = True  # We detected the device, even if using default
+                card_num = usb_device.replace("_alsa_card_", "")
+                print(f"✓ Auto-detected USB audio interface (UFO202/UCA202):")
+                print(f"  ALSA card: {card_num} (hw:{card_num},0)")
+                print(f"  Note: Using default audio device (PortAudio enumeration unavailable)")
+                print(f"  If this doesn't work, configure ALSA defaults:")
+                print(f"    sudo nano /etc/asound.conf")
+                print(f"    Add: defaults.pcm.card {card_num}")
+                print(f"         defaults.ctl.card {card_num}")
+            elif isinstance(usb_device, str):
+                # ALSA device string - use directly (shouldn't happen with current code)
                 input_dev = usb_device
                 output_dev = usb_device
-                print(f"✓ Auto-detected USB audio interface:")
-                print(f"  Input/Output:  Device {usb_device} - {devices[usb_device]['name']}")
+                print(f"✓ Auto-detected USB audio interface (UFO202/UCA202):")
+                print(f"  Input/Output:  {usb_device} (ALSA device string)")
+                print(f"  Note: Using ALSA device directly (PortAudio enumeration unavailable)")
+            else:
+                # Integer device index - try to get info
+                try:
+                    if len(devices) > 0 and usb_device < len(devices):
+                        usb_device_info = devices[usb_device]
+                    else:
+                        usb_device_info = sd.query_devices(usb_device)
+                    
+                    if usb_device_info['max_input_channels'] >= 2 and usb_device_info['max_output_channels'] >= 2:
+                        input_dev = usb_device
+                        output_dev = usb_device
+                        device_detected = True
+                        print(f"✓ Auto-detected USB audio interface (UFO202/UCA202):")
+                        print(f"  Input/Output:  Device {usb_device} - {usb_device_info.get('name', 'USB Audio CODEC')}")
+                        print(f"  Channels: {usb_device_info['max_input_channels']} in, {usb_device_info['max_output_channels']} out")
+                except Exception as e:
+                    # If we can't query device info but USB exists, use it anyway
+                    input_dev = usb_device
+                    output_dev = usb_device
+                    device_detected = True
+                    print(f"✓ Auto-detected USB audio interface (UFO202/UCA202):")
+                    print(f"  Input/Output:  Device {usb_device} (USB Audio CODEC)")
+                    print(f"  Note: Using device {usb_device} for both input and output")
         
         # Fall back to Sound Burger setup if USB not found
-        if input_dev is None or output_dev is None:
+        if not device_detected and (input_dev is None or output_dev is None):
             input_dev, output_dev = find_sound_burger_setup()
             if input_dev is not None and output_dev is not None:
                 print(f"✓ Auto-detected Sound Burger setup:")
                 print(f"  Input:  Device {input_dev} - {devices[input_dev]['name']}")
                 print(f"  Output: Device {output_dev} - {devices[output_dev]['name']}")
         
-        # Set detected devices
-        if input_dev is not None and output_dev is not None:
-            args.input = input_dev
-            args.output = output_dev
-        else:
-            print("Error: --input and --output device indices are required")
+        # Set detected devices (None is valid - uses default device)
+        args.input = input_dev
+        args.output = output_dev
+        
+        # Only error if we couldn't detect anything and user didn't specify
+        if not device_detected:
+            print("Error: Could not auto-detect audio devices")
             print("Run with --list-devices to see available devices")
             print("\nFor USB audio (UCA202, etc.):")
             print("  → Connect USB audio interface")

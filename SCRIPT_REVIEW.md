@@ -93,3 +93,4 @@
 1. **Remove duplicates:** Delete `run_on_pi.sh` and `cleanup_before_reinstall.sh` since `full_reinstall.sh` covers their functionality
 2. **Documentation:** Consider adding a README explaining when to use each script
 3. **Consolidation:** The SSH-related scripts (create_ssh_file.sh, enable_ssh_workaround.sh, troubleshoot_ssh.sh) could potentially be consolidated, but they serve different use cases so keeping them separate is fine
+
