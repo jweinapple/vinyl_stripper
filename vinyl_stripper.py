@@ -159,9 +159,10 @@ class VinylStripper:
         self.processing_queue = queue.Queue(maxsize=20)
         self.running = False
         self.buffer_filling = True
-        self.use_passthrough = False
+        self.use_passthrough = False  # Disabled - only play processed audio
         self.last_buffer_log = 0
         self.buffer_log_interval = 5.0  # Log buffer status every 5 seconds
+        self.min_buffer_before_switch = int(sample_rate * 3.0)  # Need at least 3s before switching from passthrough
         
         # Load model with device-specific optimization
         # Reference torch before any local imports to avoid UnboundLocalError
@@ -261,9 +262,13 @@ class VinylStripper:
         # Convert to torch tensor: (batch, channels, samples)
         audio_tensor = torch.from_numpy(audio.T).unsqueeze(0).float().to(self.device)
         
-        # Normalize
-        ref = audio_tensor.mean(0)
-        audio_tensor = (audio_tensor - ref.mean()) / ref.std()
+        # Normalize - compute mean and std across all samples and channels
+        ref_mean = audio_tensor.mean()
+        ref_std = audio_tensor.std()
+        # Avoid division by zero
+        if ref_std < 1e-8:
+            ref_std = torch.tensor(1.0, device=self.device)
+        audio_tensor = (audio_tensor - ref_mean) / ref_std
         
         with torch.no_grad():
             # Apply model - returns (batch, stems, channels, samples)
@@ -288,7 +293,7 @@ class VinylStripper:
                 output += sources[0, idx]
         
         # Denormalize
-        output = output * ref.std() + ref.mean()
+        output = output * ref_std + ref_mean
         
         # Convert back to numpy (samples, channels)
         return output.squeeze(0).T.cpu().numpy()
@@ -324,11 +329,12 @@ class VinylStripper:
             queue_size = self.processing_queue.qsize()
             output_queue_size = self.output_queue.qsize()
             mode = "passthrough" if self.use_passthrough else "processed"
-            logger.info(f"Buffer status: {buffer_seconds:.1f}s ({mode}) | Processing: {queue_size} queued, {output_queue_size} ready")
+            min_needed = self.min_buffer_before_switch / self.sample_rate
+            logger.info(f"Buffer status: {buffer_seconds:.1f}s ({mode}), need {min_needed:.1f}s to switch | Processing: {queue_size} queued, {output_queue_size} ready")
             self.last_buffer_log = current_time
         
-        # Store raw audio for passthrough fallback
-        self.passthrough_buffer.extend(indata.copy())
+        # Passthrough buffer disabled - not storing raw audio
+        # self.passthrough_buffer.extend(indata.copy())  # Disabled
         
         # Add input to buffer
         self.input_buffer.extend(indata.copy())
@@ -343,66 +349,98 @@ class VinylStripper:
                     self.input_buffer.popleft()
             
             # Queue for processing (non-blocking, drop if full)
-            # Only queue if we have room - prevents backing up
-            if self.processing_queue.qsize() < self.processing_queue.maxsize // 2:
+            # More aggressive queuing - keep processing pipeline busy
+            if self.processing_queue.qsize() < self.processing_queue.maxsize * 0.8:
                 try:
                     self.processing_queue.put_nowait(chunk)
                 except queue.Full:
                     pass  # Skip this chunk if we're backed up
         
         # Try to get processed audio for output
-        # Keep filling buffer until we have enough for smooth playback
-        target_buffer_size = int(self.sample_rate * 10.0)  # Target 10 second buffer for safety
-        while self.output_buffer.shape[0] < target_buffer_size:
+        # Keep filling buffer aggressively to prevent skipping
+        target_buffer_size = int(self.sample_rate * 3.0)  # Target 3 second buffer (reduced from 15s to reduce delay)
+        
+        # Always try to fill buffer if we have processed chunks available
+        # Process multiple chunks per callback to keep buffer full - keep filling until queue is empty or reasonable limit
+        chunks_added = 0
+        max_chunks_per_callback = 20  # Increased to fill buffer faster
+        # Keep filling continuously - don't stop early
+        while chunks_added < max_chunks_per_callback:
             try:
                 processed = self.output_queue.get_nowait()
-                # Only use hop_samples (non-overlapping portion) to prevent overlap artifacts
-                # This is the amount of new audio in each chunk
-                hop_portion = processed[:self.hop_samples]
-                self.output_buffer = np.vstack([self.output_buffer, hop_portion]) if self.output_buffer.shape[0] > 0 else hop_portion
+                
+                # Handle overlap correctly - skip overlap samples, use the rest
+                if self.output_buffer.shape[0] > 0:
+                    # Skip overlap samples - only add new audio
+                    hop_portion = processed[self.overlap_samples:]
+                    if hop_portion.shape[0] > 0:
+                        self.output_buffer = np.vstack([self.output_buffer, hop_portion])
+                else:
+                    # First chunk - add entire chunk
+                    self.output_buffer = processed
+                
+                chunks_added += 1
                 if self.buffer_filling and self.output_buffer.shape[0] >= target_buffer_size:
                     self.buffer_filling = False
-                    self.use_passthrough = False
                     logger.info(f"✓ Buffer ready ({self.output_buffer.shape[0] / self.sample_rate:.1f}s)")
             except queue.Empty:
                 break
         
-        # Check if we need to switch to passthrough mode
-        # Use a higher threshold to prevent premature switching
-        if self.output_buffer.shape[0] < int(self.sample_rate * 1.5) and not self.buffer_filling:
-            # Buffer is getting low - switch to passthrough temporarily
-            if not self.use_passthrough:
-                self.use_passthrough = True
-                logger.warning("⚠ Passthrough mode")
+        # Passthrough mode is disabled - only use processed audio
+        # Log buffer status for monitoring
+        current_buffer_seconds = self.output_buffer.shape[0] / self.sample_rate
+        min_buffer_seconds = self.min_buffer_before_switch / self.sample_rate
         
-        # Output what we have
-        if self.output_buffer.shape[0] >= frames and not self.use_passthrough:
-            # Use processed audio
+        if self.buffer_filling and self.output_buffer.shape[0] >= self.min_buffer_before_switch:
+            # Buffer is ready
+            self.buffer_filling = False
+            logger.info(f"✓ Buffer ready ({current_buffer_seconds:.1f}s >= {min_buffer_seconds:.1f}s)")
+        elif self.buffer_filling:
+            # Still filling - log progress occasionally
+            if int(current_buffer_seconds) % 2 == 0 and current_buffer_seconds > 0:
+                logger.debug(f"Buffer filling: {current_buffer_seconds:.1f}s / {min_buffer_seconds:.1f}s (processing queue: {self.processing_queue.qsize()}, output queue: {self.output_queue.qsize()})")
+        
+        # Output only processed audio (passthrough disabled)
+        # Check buffer level before outputting
+        buffer_seconds = self.output_buffer.shape[0] / self.sample_rate
+        min_safe_buffer = 1.0  # Minimum safe buffer in seconds
+        
+        if self.output_buffer.shape[0] >= frames:
+            # Use processed audio - ensure continuous output
             outdata[:] = self.output_buffer[:frames]
             self.output_buffer = self.output_buffer[frames:]
-            # If buffer recovered, switch back to processed mode
-            if self.output_buffer.shape[0] >= target_buffer_size:
-                self.use_passthrough = False
-        elif self.use_passthrough and len(self.passthrough_buffer) >= frames:
-            # Passthrough mode - output raw audio (better than silence)
-            passthrough_data = np.array(list(self.passthrough_buffer)[:frames])
-            outdata[:] = passthrough_data
-            # Remove used samples from passthrough buffer
-            for _ in range(frames):
-                if self.passthrough_buffer:
-                    self.passthrough_buffer.popleft()
-        else:
-            # Not enough processed audio - repeat last sample or pad with zeros
-            if self.output_buffer.shape[0] > 0:
-                # Repeat last samples to avoid complete silence
-                last_samples = self.output_buffer[-1:]
-                padding_needed = frames - self.output_buffer.shape[0]
-                padding = np.tile(last_samples, (padding_needed, 1))
-                outdata[:] = np.vstack([self.output_buffer, padding])
-                self.output_buffer = np.zeros((0, 2), dtype=np.float32)
+            
+            # Log if buffer is getting low (but not every time to avoid spam)
+            new_buffer_seconds = self.output_buffer.shape[0] / self.sample_rate
+            if new_buffer_seconds < min_safe_buffer and not self.buffer_filling:
+                if not hasattr(self, '_last_low_buffer_log') or (time_module.time() - self._last_low_buffer_log) > 1.0:
+                    logger.warning(f"⚠ Buffer low: {new_buffer_seconds:.2f}s remaining (processing: {self.processing_queue.qsize()} queued, {self.output_queue.qsize()} ready)")
+                    self._last_low_buffer_log = time_module.time()
+        elif self.output_buffer.shape[0] > 0:
+            # Partial buffer - use what we have and smoothly fade/extend
+            available = self.output_buffer.shape[0]
+            outdata[:available] = self.output_buffer
+            # Crossfade/extend last samples to avoid clicks
+            if available >= 100:  # If we have enough samples, fade out
+                fade_length = min(100, available)
+                fade_curve = np.linspace(1.0, 0.0, fade_length).reshape(-1, 1)
+                outdata[available-fade_length:available] = self.output_buffer[-fade_length:] * fade_curve
             else:
-                # Complete silence - buffer underrun (shouldn't happen with passthrough)
-                outdata[:] = 0
+                # Repeat last sample smoothly
+                last_sample = self.output_buffer[-1:]
+                outdata[available:] = last_sample
+            self.output_buffer = np.zeros((0, 2), dtype=np.float32)
+            if not hasattr(self, '_last_underrun_log') or (time_module.time() - self._last_underrun_log) > 1.0:
+                logger.warning(f"⚠ Buffer underrun - partial output ({buffer_seconds:.2f}s available, need {frames/self.sample_rate:.2f}s)")
+                self._last_underrun_log = time_module.time()
+        else:
+            # No processed audio available - output silence (will cause skipping)
+            outdata[:] = 0
+            if not self.buffer_filling:
+                # Only log occasionally to avoid spam
+                if not hasattr(self, '_last_silence_log') or (time_module.time() - self._last_silence_log) > 2.0:
+                    logger.warning(f"⚠ No processed audio - skipping (processing: {self.processing_queue.qsize()} queued, {self.output_queue.qsize()} ready)")
+                    self._last_silence_log = time_module.time()
 
     def prefill_buffer(self, duration=10.0):
         """Pre-fill output buffer before starting playback to prevent dropouts."""
@@ -434,8 +472,14 @@ class VinylStripper:
             for chunk in chunks_to_process:
                 try:
                     processed = self.process_chunk(chunk)
-                    hop_portion = processed[:self.hop_samples]
-                    self.output_buffer = np.vstack([self.output_buffer, hop_portion]) if self.output_buffer.shape[0] > 0 else hop_portion
+                    # Handle overlap correctly - skip overlap samples, use the rest
+                    if self.output_buffer.shape[0] > 0:
+                        hop_portion = processed[self.overlap_samples:]
+                        if hop_portion.shape[0] > 0:
+                            self.output_buffer = np.vstack([self.output_buffer, hop_portion])
+                    else:
+                        # First chunk - add entire chunk
+                        self.output_buffer = processed
                     processed_count += 1
                     if processed_count % 5 == 0:
                         buffer_seconds = self.output_buffer.shape[0] / self.sample_rate
@@ -456,7 +500,10 @@ class VinylStripper:
         process_thread = threading.Thread(target=self.processing_worker, daemon=True)
         process_thread.start()
         
-        logger.info("Starting audio stream... Press Ctrl+C to stop")
+        logger.info("Starting audio stream...")
+        logger.info("Note: Only processed audio will be played (passthrough disabled)")
+        logger.info("Audio will be silent until buffer is ready")
+        logger.info("Press Ctrl+C to stop")
         
         try:
             # If device is an ALSA string, try to use ALSA host API
