@@ -152,21 +152,29 @@ class VinylStripper:
         self.overlap_samples = int(self.chunk_samples * overlap)
         self.hop_samples = self.chunk_samples - self.overlap_samples
         
-        self.input_buffer = deque(maxlen=self.chunk_samples * 16)
-        self.output_queue = queue.Queue(maxsize=50)
+        self.input_buffer = deque(maxlen=self.chunk_samples * 32)  # Increased buffer size
+        self.output_queue = queue.Queue(maxsize=200)  # Larger output queue to prevent blocking
         self.output_buffer = np.zeros((0, 2), dtype=np.float32)
         self.passthrough_buffer = deque(maxlen=int(sample_rate * 3))
-        self.processing_queue = queue.Queue(maxsize=20)
+        self.processing_queue = queue.Queue(maxsize=100)  # Larger processing queue
         self.running = False
         self.buffer_filling = True
-        self.use_passthrough = False  # Disabled - only play processed audio
+        self.use_passthrough = True  # Start with passthrough for immediate audio
         self.last_buffer_log = 0
         self.buffer_log_interval = 5.0  # Log buffer status every 5 seconds
-        self.min_buffer_before_switch = int(sample_rate * 3.0)  # Need at least 3s before switching from passthrough
+        self.min_buffer_before_switch = int(sample_rate * 0.2)  # Start playing with just 0.2s buffer (very low latency)
+        self.crossfade_samples = int(sample_rate * 0.01)  # 10ms crossfade for smooth transition
+        self.switching_to_processed = False  # Track if we're in transition
         
         # Load model with device-specific optimization
         # Reference torch before any local imports to avoid UnboundLocalError
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Priority: CUDA > MPS (Apple Silicon) > CPU
+        if torch.cuda.is_available():
+            self.device = "cuda"
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            self.device = "mps"
+        else:
+            self.device = "cpu"
         model_name = self.model_name if self.model_name else "htdemucs_ft"
         
         logger.info(f"Loading model: {model_name} (device: {self.device})...")
@@ -178,13 +186,18 @@ class VinylStripper:
             logger.warning("Consider using lighter model (htdemucs) or increasing swap space.")
         
         try:
-            # Set environment variables for better CPU performance
-            # Use more threads for better parallel processing
-            import multiprocessing
-            num_threads = min(multiprocessing.cpu_count(), 4)  # Use up to 4 threads
-            os.environ['OMP_NUM_THREADS'] = str(num_threads)
-            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
-            logger.info(f"Using {num_threads} CPU threads for processing")
+            # Set environment variables for better performance
+            if self.device == "cpu":
+                # Use more threads for better parallel processing on CPU
+                import multiprocessing
+                num_threads = min(multiprocessing.cpu_count(), 4)  # Use up to 4 threads
+                os.environ['OMP_NUM_THREADS'] = str(num_threads)
+                logger.info(f"Using {num_threads} CPU threads for processing")
+            elif self.device == "cuda":
+                os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+                logger.info("Using CUDA GPU acceleration")
+            elif self.device == "mps":
+                logger.info("Using Apple Silicon GPU (Metal Performance Shaders)")
             
             logger.info("Fetching model from demucs...")
             self.model = get_model(model_name)
@@ -222,7 +235,8 @@ class VinylStripper:
             is_bag_of_models = False
         
         if not is_bag_of_models:
-            if hasattr(torch, 'compile') and self.device != 'cpu':
+            # torch.compile not supported on MPS yet, only CUDA
+            if hasattr(torch, 'compile') and self.device == 'cuda':
                 try:
                     self.model = torch.compile(self.model, mode='reduce-overhead')
                     logger.info("✓ Model compiled")
@@ -286,17 +300,38 @@ class VinylStripper:
         # sources shape: (1, 4, 2, samples)
         # stems are: drums, bass, other, vocals
         
+        # Verify sources shape
+        if sources.shape[1] != 4:
+            logger.error(f"Unexpected sources shape: {sources.shape}, expected (batch, 4, channels, samples)")
+        
         # Sum all stems except the ones we want to remove
         output = torch.zeros_like(audio_tensor)
+        stems_kept = []
+        stems_removed = []
         for stem_name, idx in self.stem_indices.items():
             if stem_name not in self.remove_stems:
                 output += sources[0, idx]
+                stems_kept.append(stem_name)
+            else:
+                stems_removed.append(stem_name)
+        
+        # Debug: Log occasionally to verify processing
+        import time as time_module
+        if not hasattr(self, '_last_process_log') or (time_module.time() - self._last_process_log) > 5.0:
+            logger.info(f"✓ Processing active: Removing {stems_removed}, Keeping {stems_kept}")
+            input_energy = audio_tensor.abs().mean().item()
+            output_energy = output.abs().mean().item()
+            reduction = ((input_energy - output_energy) / input_energy * 100) if input_energy > 0 else 0
+            logger.info(f"  Energy: Input={input_energy:.4f}, Output={output_energy:.4f} ({reduction:.1f}% reduction)")
+            self._last_process_log = time_module.time()
         
         # Denormalize
         output = output * ref_std + ref_mean
         
         # Convert back to numpy (samples, channels)
-        return output.squeeze(0).T.cpu().numpy()
+        result = output.squeeze(0).T.cpu().numpy()
+        
+        return result
 
     def processing_worker(self):
         """Background thread that processes audio chunks."""
@@ -333,11 +368,26 @@ class VinylStripper:
             logger.info(f"Buffer status: {buffer_seconds:.1f}s ({mode}), need {min_needed:.1f}s to switch | Processing: {queue_size} queued, {output_queue_size} ready")
             self.last_buffer_log = current_time
         
-        # Passthrough buffer disabled - not storing raw audio
-        # self.passthrough_buffer.extend(indata.copy())  # Disabled
+        # Store raw audio for passthrough fallback (enabled for immediate audio)
+        self.passthrough_buffer.extend(indata.copy())
+        
+        # Resample input if needed
+        input_audio = indata.copy()
+        if hasattr(self, 'needs_input_resampling') and self.needs_input_resampling:
+            if self.resample_func:
+                # Resample from input_sr to output_sr
+                target_samples = int(len(input_audio) * self.output_sample_rate / self.input_sample_rate)
+                input_audio = self.resample_func(input_audio, target_samples, axis=0)
+            else:
+                # Simple linear interpolation fallback
+                from numpy import linspace, interp
+                old_indices = np.arange(len(input_audio))
+                new_length = int(len(input_audio) * self.output_sample_rate / self.input_sample_rate)
+                new_indices = linspace(0, len(input_audio) - 1, new_length)
+                input_audio = np.array([interp(new_indices, old_indices, input_audio[:, ch]) for ch in range(input_audio.shape[1])]).T
         
         # Add input to buffer
-        self.input_buffer.extend(indata.copy())
+        self.input_buffer.extend(input_audio)
         
         # If we have enough samples, queue a chunk for processing
         if len(self.input_buffer) >= self.chunk_samples:
@@ -349,32 +399,55 @@ class VinylStripper:
                     self.input_buffer.popleft()
             
             # Queue for processing (non-blocking, drop if full)
-            # More aggressive queuing - keep processing pipeline busy
-            if self.processing_queue.qsize() < self.processing_queue.maxsize * 0.8:
+            # Keep processing pipeline busy - queue aggressively
+            try:
+                self.processing_queue.put_nowait(chunk)
+            except queue.Full:
+                # If queue is full, drop oldest chunk and add new one to prevent lag
                 try:
-                    self.processing_queue.put_nowait(chunk)
-                except queue.Full:
-                    pass  # Skip this chunk if we're backed up
+                    _ = self.processing_queue.get_nowait()  # Remove oldest
+                    self.processing_queue.put_nowait(chunk)  # Add new
+                except:
+                    pass  # Skip if still can't queue
         
         # Try to get processed audio for output
         # Keep filling buffer aggressively to prevent skipping
-        target_buffer_size = int(self.sample_rate * 3.0)  # Target 3 second buffer (reduced from 15s to reduce delay)
+        target_buffer_size = int(self.sample_rate * 1.0)  # Target 1 second buffer (reduced for lower latency)
         
         # Always try to fill buffer if we have processed chunks available
-        # Process multiple chunks per callback to keep buffer full - keep filling until queue is empty or reasonable limit
+        # Process multiple chunks per callback to keep buffer full
         chunks_added = 0
-        max_chunks_per_callback = 20  # Increased to fill buffer faster
-        # Keep filling continuously - don't stop early
+        max_chunks_per_callback = 20  # Process up to 20 chunks per callback
+        
         while chunks_added < max_chunks_per_callback:
             try:
                 processed = self.output_queue.get_nowait()
                 
-                # Handle overlap correctly - skip overlap samples, use the rest
+                # Handle overlap with proper crossfading to avoid clicks/pops
                 if self.output_buffer.shape[0] > 0:
-                    # Skip overlap samples - only add new audio
-                    hop_portion = processed[self.overlap_samples:]
-                    if hop_portion.shape[0] > 0:
-                        self.output_buffer = np.vstack([self.output_buffer, hop_portion])
+                    # We have existing buffer - need to handle overlap
+                    if self.output_buffer.shape[0] >= self.overlap_samples:
+                        # Crossfade the overlap region
+                        overlap_region_old = self.output_buffer[-self.overlap_samples:]
+                        overlap_region_new = processed[:self.overlap_samples]
+                        
+                        # Create crossfade window (fade out old, fade in new)
+                        fade_out = np.linspace(1.0, 0.0, self.overlap_samples).reshape(-1, 1)
+                        fade_in = np.linspace(0.0, 1.0, self.overlap_samples).reshape(-1, 1)
+                        
+                        # Crossfade the overlap
+                        crossfaded = overlap_region_old * fade_out + overlap_region_new * fade_in
+                        
+                        # Replace overlap region with crossfaded version
+                        self.output_buffer[-self.overlap_samples:] = crossfaded
+                        
+                        # Add the rest of the new chunk (after overlap)
+                        if processed.shape[0] > self.overlap_samples:
+                            new_portion = processed[self.overlap_samples:]
+                            self.output_buffer = np.vstack([self.output_buffer, new_portion])
+                    else:
+                        # Not enough buffer yet - just append (will handle overlap later)
+                        self.output_buffer = np.vstack([self.output_buffer, processed])
                 else:
                     # First chunk - add entire chunk
                     self.output_buffer = processed
@@ -386,61 +459,112 @@ class VinylStripper:
             except queue.Empty:
                 break
         
-        # Passthrough mode is disabled - only use processed audio
-        # Log buffer status for monitoring
+        # Check if we should switch from passthrough to processed audio
         current_buffer_seconds = self.output_buffer.shape[0] / self.sample_rate
         min_buffer_seconds = self.min_buffer_before_switch / self.sample_rate
         
-        if self.buffer_filling and self.output_buffer.shape[0] >= self.min_buffer_before_switch:
-            # Buffer is ready
+        # Switch to processed audio when buffer is ready (with crossfade)
+        if self.use_passthrough and self.output_buffer.shape[0] >= self.min_buffer_before_switch:
+            if not self.switching_to_processed:
+                self.switching_to_processed = True
+                self.buffer_filling = False
+                logger.info(f"✓ Starting transition to processed audio ({current_buffer_seconds:.1f}s buffer ready)")
+        elif self.buffer_filling and self.output_buffer.shape[0] >= self.min_buffer_before_switch:
             self.buffer_filling = False
-            logger.info(f"✓ Buffer ready ({current_buffer_seconds:.1f}s >= {min_buffer_seconds:.1f}s)")
-        elif self.buffer_filling:
-            # Still filling - log progress occasionally
-            if int(current_buffer_seconds) % 2 == 0 and current_buffer_seconds > 0:
-                logger.debug(f"Buffer filling: {current_buffer_seconds:.1f}s / {min_buffer_seconds:.1f}s (processing queue: {self.processing_queue.qsize()}, output queue: {self.output_queue.qsize()})")
         
-        # Output only processed audio (passthrough disabled)
-        # Check buffer level before outputting
+        # Note: Crossfade completion is handled in the crossfade output block
+        
+        # Output logic: prefer processed audio, fall back to passthrough
         buffer_seconds = self.output_buffer.shape[0] / self.sample_rate
-        min_safe_buffer = 1.0  # Minimum safe buffer in seconds
         
-        if self.output_buffer.shape[0] >= frames:
+        # Handle crossfade transition
+        if self.switching_to_processed and self.output_buffer.shape[0] >= frames and len(self.passthrough_buffer) >= frames:
+            # Crossfade between passthrough and processed over the crossfade duration
+            passthrough_data = np.array(list(self.passthrough_buffer)[:frames])
+            processed_data = self.output_buffer[:frames]
+            
+            # Create crossfade window (fade out passthrough, fade in processed)
+            crossfade_len = min(frames, self.crossfade_samples)
+            fade_out = np.linspace(1.0, 0.0, crossfade_len).reshape(-1, 1)
+            fade_in = np.linspace(0.0, 1.0, crossfade_len).reshape(-1, 1)
+            
+            # Apply crossfade to the beginning of the frame
+            outdata[:crossfade_len] = passthrough_data[:crossfade_len] * fade_out + processed_data[:crossfade_len] * fade_in
+            
+            # Rest of frame uses processed audio
+            if frames > crossfade_len:
+                outdata[crossfade_len:] = processed_data[crossfade_len:]
+            
+            # Update buffers
+            self.output_buffer = self.output_buffer[frames:]
+            for _ in range(frames):
+                if self.passthrough_buffer:
+                    self.passthrough_buffer.popleft()
+            
+            # Track crossfade progress
+            if not hasattr(self, '_crossfade_samples_used'):
+                self._crossfade_samples_used = 0
+            self._crossfade_samples_used += frames
+            
+            # Complete transition after crossfade duration
+            if self._crossfade_samples_used >= self.crossfade_samples:
+                self.use_passthrough = False
+                self.switching_to_processed = False
+                self._crossfade_samples_used = 0
+                logger.info("✓ Crossfade complete - fully using processed audio")
+        elif not self.use_passthrough and self.output_buffer.shape[0] >= frames:
             # Use processed audio - ensure continuous output
             outdata[:] = self.output_buffer[:frames]
             self.output_buffer = self.output_buffer[frames:]
             
-            # Log if buffer is getting low (but not every time to avoid spam)
+            # Switch back to passthrough if buffer runs low
             new_buffer_seconds = self.output_buffer.shape[0] / self.sample_rate
-            if new_buffer_seconds < min_safe_buffer and not self.buffer_filling:
+            if new_buffer_seconds < 0.1 and not self.buffer_filling:
+                self.use_passthrough = True
                 if not hasattr(self, '_last_low_buffer_log') or (time_module.time() - self._last_low_buffer_log) > 1.0:
-                    logger.warning(f"⚠ Buffer low: {new_buffer_seconds:.2f}s remaining (processing: {self.processing_queue.qsize()} queued, {self.output_queue.qsize()} ready)")
+                    logger.warning(f"⚠ Buffer low - switching to passthrough ({new_buffer_seconds:.2f}s remaining)")
                     self._last_low_buffer_log = time_module.time()
-        elif self.output_buffer.shape[0] > 0:
-            # Partial buffer - use what we have and smoothly fade/extend
-            available = self.output_buffer.shape[0]
-            outdata[:available] = self.output_buffer
-            # Crossfade/extend last samples to avoid clicks
-            if available >= 100:  # If we have enough samples, fade out
-                fade_length = min(100, available)
-                fade_curve = np.linspace(1.0, 0.0, fade_length).reshape(-1, 1)
-                outdata[available-fade_length:available] = self.output_buffer[-fade_length:] * fade_curve
-            else:
-                # Repeat last sample smoothly
-                last_sample = self.output_buffer[-1:]
-                outdata[available:] = last_sample
-            self.output_buffer = np.zeros((0, 2), dtype=np.float32)
-            if not hasattr(self, '_last_underrun_log') or (time_module.time() - self._last_underrun_log) > 1.0:
-                logger.warning(f"⚠ Buffer underrun - partial output ({buffer_seconds:.2f}s available, need {frames/self.sample_rate:.2f}s)")
-                self._last_underrun_log = time_module.time()
+        elif self.use_passthrough and len(self.passthrough_buffer) >= frames:
+            # Passthrough mode - output raw audio immediately
+            passthrough_data = np.array(list(self.passthrough_buffer)[:frames])
+            outdata[:] = passthrough_data
+            # Remove used samples from passthrough buffer
+            for _ in range(frames):
+                if self.passthrough_buffer:
+                    self.passthrough_buffer.popleft()
+        elif not self.use_passthrough and self.output_buffer.shape[0] > 0:
+            # Partial processed buffer - use what we have, fill rest with passthrough
+            available = min(self.output_buffer.shape[0], frames)
+            outdata[:available] = self.output_buffer[:available]
+            self.output_buffer = self.output_buffer[available:]
+            
+            # Fill rest with passthrough if available
+            if available < frames and len(self.passthrough_buffer) >= (frames - available):
+                passthrough_needed = frames - available
+                passthrough_data = np.array(list(self.passthrough_buffer)[:passthrough_needed])
+                outdata[available:] = passthrough_data
+                for _ in range(passthrough_needed):
+                    if self.passthrough_buffer:
+                        self.passthrough_buffer.popleft()
+            elif available < frames:
+                # Pad with last sample
+                last_sample = outdata[available-1:available] if available > 0 else np.zeros((1, 2), dtype=np.float32)
+                outdata[available:] = np.tile(last_sample, (frames - available, 1))
+        elif self.use_passthrough and len(self.passthrough_buffer) > 0:
+            # Partial passthrough buffer - use what we have
+            available = min(len(self.passthrough_buffer), frames)
+            passthrough_data = np.array(list(self.passthrough_buffer)[:available])
+            outdata[:available] = passthrough_data
+            for _ in range(available):
+                if self.passthrough_buffer:
+                    self.passthrough_buffer.popleft()
+            # Pad with last sample
+            if available < frames:
+                last_sample = passthrough_data[-1:] if available > 0 else np.zeros((1, 2), dtype=np.float32)
+                outdata[available:] = np.tile(last_sample, (frames - available, 1))
         else:
-            # No processed audio available - output silence (will cause skipping)
+            # No audio available - output silence (shouldn't happen with passthrough)
             outdata[:] = 0
-            if not self.buffer_filling:
-                # Only log occasionally to avoid spam
-                if not hasattr(self, '_last_silence_log') or (time_module.time() - self._last_silence_log) > 2.0:
-                    logger.warning(f"⚠ No processed audio - skipping (processing: {self.processing_queue.qsize()} queued, {self.output_queue.qsize()} ready)")
-                    self._last_silence_log = time_module.time()
 
     def prefill_buffer(self, duration=10.0):
         """Pre-fill output buffer before starting playback to prevent dropouts."""
@@ -467,19 +591,34 @@ class VinylStripper:
             
             logger.info(f"Processing {len(chunks_to_process)} pre-fill chunks...")
             
-            # Process chunks and fill buffer
+            # Process chunks and fill buffer with proper overlap handling
             processed_count = 0
             for chunk in chunks_to_process:
                 try:
                     processed = self.process_chunk(chunk)
-                    # Handle overlap correctly - skip overlap samples, use the rest
+                    
+                    # Handle overlap with proper crossfading (same as main callback)
                     if self.output_buffer.shape[0] > 0:
-                        hop_portion = processed[self.overlap_samples:]
-                        if hop_portion.shape[0] > 0:
-                            self.output_buffer = np.vstack([self.output_buffer, hop_portion])
+                        if self.output_buffer.shape[0] >= self.overlap_samples:
+                            # Crossfade the overlap region
+                            overlap_region_old = self.output_buffer[-self.overlap_samples:]
+                            overlap_region_new = processed[:self.overlap_samples]
+                            
+                            fade_out = np.linspace(1.0, 0.0, self.overlap_samples).reshape(-1, 1)
+                            fade_in = np.linspace(0.0, 1.0, self.overlap_samples).reshape(-1, 1)
+                            
+                            crossfaded = overlap_region_old * fade_out + overlap_region_new * fade_in
+                            self.output_buffer[-self.overlap_samples:] = crossfaded
+                            
+                            if processed.shape[0] > self.overlap_samples:
+                                new_portion = processed[self.overlap_samples:]
+                                self.output_buffer = np.vstack([self.output_buffer, new_portion])
+                        else:
+                            self.output_buffer = np.vstack([self.output_buffer, processed])
                     else:
                         # First chunk - add entire chunk
                         self.output_buffer = processed
+                    
                     processed_count += 1
                     if processed_count % 5 == 0:
                         buffer_seconds = self.output_buffer.shape[0] / self.sample_rate
@@ -500,15 +639,60 @@ class VinylStripper:
         process_thread = threading.Thread(target=self.processing_worker, daemon=True)
         process_thread.start()
         
-        logger.info("Starting audio stream...")
-        logger.info("Note: Only processed audio will be played (passthrough disabled)")
-        logger.info("Audio will be silent until buffer is ready")
+        # Skip pre-fill for low latency - start immediately with passthrough
+        # Audio will play immediately via passthrough, then switch to processed when ready
+        logger.info("Starting audio stream immediately (passthrough mode)...")
+        logger.info("Will switch to processed audio when buffer is ready (~0.2s)")
         logger.info("Press Ctrl+C to stop")
         
         try:
-            # If device is an ALSA string, try to use ALSA host API
+            # Auto-detect sample rates for input and output devices
+            input_sr = self.sample_rate
+            output_sr = self.sample_rate
+            try:
+                if isinstance(self.input_device, int):
+                    input_dev_info = sd.query_devices(self.input_device)
+                    if 'default_samplerate' in input_dev_info and input_dev_info['default_samplerate']:
+                        input_sr = int(input_dev_info['default_samplerate'])
+                if isinstance(self.output_device, int):
+                    output_dev_info = sd.query_devices(self.output_device)
+                    if 'default_samplerate' in output_dev_info and output_dev_info['default_samplerate']:
+                        output_sr = int(output_dev_info['default_samplerate'])
+                
+                # PortAudio requires same sample rate for duplex streams
+                # Use output device's rate and resample input if needed
+                actual_sample_rate = output_sr
+                self.input_sample_rate = input_sr
+                self.output_sample_rate = output_sr
+                self.needs_input_resampling = (input_sr != output_sr)
+                
+                if self.needs_input_resampling:
+                    logger.info(f"Sample rate mismatch: input={input_sr} Hz, output={output_sr} Hz")
+                    logger.info(f"Using {actual_sample_rate} Hz for stream, will resample input from {input_sr} Hz")
+                    # Import resampling function
+                    try:
+                        from scipy import signal
+                        self.resample_func = signal.resample
+                    except ImportError:
+                        logger.warning("scipy not available, using numpy-based resampling")
+                        self.resample_func = None
+                else:
+                    logger.info(f"Using sample rate: {actual_sample_rate} Hz")
+                
+                # Update sample rate for processing
+                self.sample_rate = actual_sample_rate
+                # Recalculate chunk sizes
+                self.chunk_samples = int(self.chunk_duration * actual_sample_rate)
+                self.overlap_samples = int(self.chunk_samples * self.overlap)
+                self.hop_samples = self.chunk_samples - self.overlap_samples
+            except Exception as e:
+                logger.debug(f"Could not auto-detect sample rate: {e}")
+                self.needs_resampling = False
+                self.output_sample_rate = self.sample_rate
+            
+            # Stream configuration
             stream_kwargs = {
-                'samplerate': self.sample_rate,
+                'samplerate': actual_sample_rate,
                 'channels': 2,
                 'dtype': np.float32,
                 'blocksize': 8192,
@@ -516,18 +700,16 @@ class VinylStripper:
                 'callback': self.audio_callback,
             }
             
-            # Handle ALSA device strings by finding ALSA host API
-            if isinstance(self.input_device, str) or isinstance(self.output_device, str):
-                # Find ALSA host API
-                try:
-                    for i in range(sd.query_hostapis()):
-                        api = sd.query_hostapis(i)
-                        if 'alsa' in api['name'].lower():
-                            stream_kwargs['hostapi'] = i
-                            logger.info(f"Using ALSA host API: {api['name']}")
-                            break
-                except:
-                    pass
+            # Find ALSA host API for better device handling
+            try:
+                for i in range(sd.query_hostapis()):
+                    api = sd.query_hostapis(i)
+                    if 'alsa' in api['name'].lower():
+                        stream_kwargs['hostapi'] = i
+                        logger.info(f"Using ALSA host API: {api['name']}")
+                        break
+            except:
+                pass
             
             stream_kwargs['device'] = (self.input_device, self.output_device)
             
@@ -800,8 +982,8 @@ Available stems: vocals, drums, bass, other
     parser.add_argument(
         "--chunk",
         type=float,
-        default=2.5,
-        help="Chunk duration in seconds (default: 2.5, balanced for efficiency and latency)"
+        default=0.2,
+        help="Chunk duration in seconds (default: 0.2, optimized for real-time processing)"
     )
     parser.add_argument(
         "--model",

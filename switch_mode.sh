@@ -74,3 +74,7 @@ echo "View logs with: sudo journalctl -u $SERVICE -f"
 
 
 
+
+
+
+
