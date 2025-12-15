@@ -13,7 +13,7 @@ Spleeter requires TensorFlow, which has compatibility issues with Python 3.13:
 
 ## Setup Instructions
 
-### Option 1: Automated Setup (Recommended)
+### Option A: Automated Setup Script (Recommended)
 
 Run the setup script on your Raspberry Pi:
 
@@ -23,14 +23,20 @@ chmod +x setup_python311_pi.sh
 ./setup_python311_pi.sh
 ```
 
+The script offers two methods:
+- **Method A (pyenv)**: Builds Python 3.11 from source (~1-2 hours) - works everywhere
+- **Method B (apt)**: Attempts to install via apt backports - faster if available
+
 **Note:** Building Python 3.11 from source takes 1-2 hours on a Raspberry Pi. The script will:
 1. Install build dependencies
-2. Install pyenv
-3. Build Python 3.11.9 from source
+2. Install pyenv (if using method A)
+3. Build/install Python 3.11.9
 4. Create a new virtual environment (`venv311`)
 5. Install all dependencies
 
-### Option 2: Manual Setup
+### Option B: Manual pyenv Setup
+
+If you prefer to set up pyenv manually:
 
 If you prefer to do it manually:
 
@@ -94,6 +100,22 @@ python3 --version
 - Ensure you're using `tensorflow==2.13.0` (not 2.20.0)
 - Verify `tensorflow-estimator` is installed
 - Check that the TensorFlow compatibility patches in `test_spleeter_new.py` are active
+
+## Alternative: Deadsnakes PPA (Ubuntu only)
+
+**Note:** Deadsnakes PPA is for Ubuntu. Raspberry Pi OS is Debian-based, so deadsnakes won't work directly.
+
+If you're on Ubuntu (not Raspberry Pi OS), you can use deadsnakes:
+
+```bash
+sudo apt update
+sudo apt install -y software-properties-common
+sudo add-apt-repository ppa:deadsnakes/ppa
+sudo apt update
+sudo apt install -y python3.11 python3.11-venv python3.11-dev
+```
+
+For Raspberry Pi OS, use **pyenv** (Option A in the setup script).
 
 ## Why Not Python 3.12?
 
