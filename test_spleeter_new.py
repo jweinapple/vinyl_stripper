@@ -2,10 +2,38 @@
 """
 Spleeter Test Script - Built from scratch with TensorFlow compatibility fixes
 Uses Universal Audio (ua) as input and Mac speakers as output
+
+IMPORTANT: On Raspberry Pi, Python 3.11 is required due to TensorFlow compatibility.
+Python 3.13+ will cause "Unsupported object type NoneType" errors.
+See PYTHON_VERSION_REQUIREMENT.md for setup instructions.
 """
 
 import sys
 import os
+
+# Check Python version on Raspberry Pi
+if os.path.exists('/proc/device-tree/model'):
+    try:
+        with open('/proc/device-tree/model', 'r') as f:
+            if 'raspberry pi' in f.read().lower():
+                python_version = sys.version_info
+                if python_version.major == 3 and python_version.minor >= 13:
+                    print("=" * 60)
+                    print("WARNING: Python 3.13+ detected on Raspberry Pi")
+                    print("=" * 60)
+                    print("Spleeter requires Python 3.11 due to TensorFlow compatibility.")
+                    print("You may encounter 'Unsupported object type NoneType' errors.")
+                    print("")
+                    print("To fix:")
+                    print("  1. Run: ./setup_python311_pi.sh")
+                    print("  2. Use: source venv311/bin/activate")
+                    print("")
+                    print("See PYTHON_VERSION_REQUIREMENT.md for details.")
+                    print("=" * 60)
+                    print("")
+                    # Don't exit - let user decide if they want to proceed
+    except:
+        pass
 
 # TensorFlow compatibility fix - must be done before importing tensorflow
 try:
@@ -44,6 +72,45 @@ try:
         pass
     
     print(f"✓ TensorFlow optimized: {num_cores} threads, oneDNN enabled")
+    
+    # Fix compat.v1.keras import issue for Spleeter
+    # Spleeter tries to import 'tensorflow.compat.v1.keras.initializers' as a module
+    # We need to create the module structure in sys.modules BEFORE Spleeter imports
+    try:
+        import sys
+        import types
+        
+        # Ensure compat.v1 exists
+        if not hasattr(tf.compat, 'v1'):
+            tf.compat.v1 = types.ModuleType('tensorflow.compat.v1')
+        
+        # Create the module structure that Spleeter expects
+        if 'tensorflow.compat.v1.keras' not in sys.modules:
+            # Import actual keras
+            import tensorflow.keras as tf_keras
+            
+            # Create module structure
+            keras_module = types.ModuleType('tensorflow.compat.v1.keras')
+            keras_module.initializers = tf_keras.initializers
+            keras_module.layers = tf_keras.layers
+            keras_module.models = tf_keras.models
+            keras_module.backend = tf_keras.backend
+            
+            # Also set as attribute
+            tf.compat.v1.keras = keras_module
+            
+            # Add to sys.modules so importlib can find it
+            sys.modules['tensorflow.compat.v1.keras'] = keras_module
+            sys.modules['tensorflow.compat.v1.keras.initializers'] = tf_keras.initializers
+            sys.modules['tensorflow.compat.v1.keras.layers'] = tf_keras.layers
+            
+            print("✓ Patched tensorflow.compat.v1.keras module structure")
+        else:
+            print("✓ tensorflow.compat.v1.keras already patched")
+    except Exception as e:
+        print(f"Warning: Could not patch tensorflow.compat.v1.keras: {e}")
+        import traceback
+        traceback.print_exc()
     
     # Try to add estimator if missing
     if not hasattr(tf, 'estimator'):
@@ -133,29 +200,78 @@ def find_mac_speakers():
 
 
 def find_usb_audio_device():
-    """Auto-detect USB audio interface (for Pi)."""
+    """Auto-detect USB audio interface (for Pi) - UFO202 from Soundburger."""
     devices = sd.query_devices()
+    # First, look for UFO202/UCA202 specifically (Soundburger vinyl player)
+    # These typically show as "USB Audio" with input only
     for i, device in enumerate(devices):
         name = device['name'].lower()
-        if ('usb' in name and ('codec' in name or 'audio' in name)) or \
-           any(x in name for x in ['uca202', 'ufo202', 'behringer', 'scarlett']):
-            if device['max_input_channels'] >= 2 and device['max_output_channels'] >= 2:
-                logger.info(f"Found USB audio device: {i} - {device['name']}")
-                return i
+        if ('ufo202' in name or 'uca202' in name) and device['max_input_channels'] > 0:
+            logger.info(f"Found UFO202/UCA202 input device: {i} - {device['name']}")
+            return i
+    # Look for USB Audio device with input but no output (typical UFO202 pattern)
+    for i, device in enumerate(devices):
+        name = device['name'].lower()
+        if 'usb' in name and 'audio' in name and device['max_input_channels'] > 0 and device['max_output_channels'] == 0:
+            logger.info(f"Found USB Audio input device (likely UFO202): {i} - {device['name']}")
+            return i
+    # Then look for stereo USB devices (preferred)
+    for i, device in enumerate(devices):
+        name = device['name'].lower()
+        if 'usb' in name and device['max_input_channels'] >= 2:
+            logger.info(f"Found stereo USB audio device: {i} - {device['name']}")
+            return i
+    # Then look for any USB device with input (mono is OK, we'll handle it)
+    for i, device in enumerate(devices):
+        name = device['name'].lower()
+        if 'usb' in name and device['max_input_channels'] > 0:
+            logger.info(f"Found USB audio device (mono): {i} - {device['name']}")
+            return i
+    # Fallback: use first device with input
+    for i, device in enumerate(devices):
+        if device['max_input_channels'] > 0:
+            logger.info(f"Using device {i} as fallback: {device['name']}")
+            return i
     return None
 
 
 def find_pi_output_device():
-    """Auto-detect Pi output device (HiFi DAC HAT or headphone jack)."""
+    """Auto-detect Pi output device (USB to 3.5mm adapter, HiFi DAC HAT, USB CODEC, or headphone jack)."""
     devices = sd.query_devices()
-    # Look for HiFi DAC HAT first
+    # Look for USB Audio CODEC with output but no input (JSAUX USB to 3.5mm adapter pattern)
+    # This is typically device 1 when UFO202 is device 0
+    for i, device in enumerate(devices):
+        name = device['name'].lower()
+        if device['max_output_channels'] >= 2 and device['max_input_channels'] == 0:
+            if 'usb' in name and ('codec' in name or 'audio' in name):
+                logger.info(f"Found USB audio adapter output (JSAUX): {i} - {device['name']}")
+                return i
+    # Look for USB audio devices with output (but not UFO202 input)
+    for i, device in enumerate(devices):
+        name = device['name'].lower()
+        if device['max_output_channels'] >= 2:
+            # Look for USB audio devices that are NOT the UFO202 input
+            if 'usb' in name and ('codec' in name or 'audio' in name):
+                # Check if this is NOT the input device (UFO202 typically has 'ufo202' or 'uca202' in name)
+                if 'ufo202' not in name and 'uca202' not in name:
+                    logger.info(f"Found USB audio adapter output: {i} - {device['name']}")
+                    return i
+    # Look for HiFi DAC HAT
     for i, device in enumerate(devices):
         name = device['name'].lower()
         if device['max_output_channels'] >= 2:
             if ('hifiberry' in name and 'dac' in name) or 'bcm2835' in name:
                 logger.info(f"Found Pi output device: {i} - {device['name']}")
                 return i
-    # Fallback: default output
+    # Fallback: first stereo output device that's not the input
+    for i, device in enumerate(devices):
+        if device['max_output_channels'] >= 2:
+            name = device['name'].lower()
+            # Skip if it's the UFO202 input device
+            if 'ufo202' not in name and 'uca202' not in name:
+                logger.info(f"Using output device: {i} - {device['name']}")
+                return i
+    # Last resort: default output
     try:
         default_output = sd.query_devices(kind='output')
         logger.info(f"Using default output device: {default_output['index']} - {default_output['name']}")
@@ -397,11 +513,18 @@ class SpleeterProcessor:
         if status:
             logger.debug(f"Audio status: {status}")
         
+        # Convert mono to stereo if needed
+        if indata.shape[1] == 1:
+            # Mono input: duplicate to stereo
+            indata_stereo = np.repeat(indata, 2, axis=1)
+        else:
+            indata_stereo = indata
+        
         # Store passthrough
-        self.passthrough_buffer.extend(indata.copy())
+        self.passthrough_buffer.extend(indata_stereo.copy())
         
         # Add to input buffer
-        self.input_buffer.extend(indata.copy())
+        self.input_buffer.extend(indata_stereo.copy())
         
         # Queue chunks for processing (with hop to create overlap)
         while len(self.input_buffer) >= self.chunk_samples:
@@ -463,10 +586,35 @@ class SpleeterProcessor:
         logger.info("Press Ctrl+C to stop")
         logger.info("=" * 60)
         
+        # Detect input/output channel counts and sample rate
+        input_info = sd.query_devices(self.input_device)
+        output_info = sd.query_devices(self.output_device)
+        input_channels = input_info['max_input_channels']
+        output_channels = output_info['max_output_channels']
+        
+        # Use actual channel counts (handle mono input)
+        input_ch = min(input_channels, 1) if input_channels > 0 else 1
+        output_ch = min(output_channels, 2) if output_channels > 0 else 2
+        
+        # Use device's preferred sample rate if different from default
+        device_sample_rate = int(input_info.get('default_samplerate', self.sample_rate))
+        if device_sample_rate != self.sample_rate:
+            logger.info(f"Device sample rate ({device_sample_rate} Hz) differs from default ({self.sample_rate} Hz)")
+            logger.info(f"Using device sample rate: {device_sample_rate} Hz")
+            # Update sample rate and recalculate chunk sizes
+            self.sample_rate = device_sample_rate
+            self.chunk_samples = int(self.chunk_duration * self.sample_rate)
+            self.overlap_samples = int(0.1 * self.sample_rate)
+            self.hop_samples = self.chunk_samples - self.overlap_samples
+            self.min_buffer_samples = int(DEFAULT_MIN_BUFFER * self.sample_rate)
+            self.low_buffer_threshold = int(DEFAULT_LOW_THRESHOLD * self.sample_rate)
+        
+        logger.info(f"Stream config: {input_ch} input channel(s), {output_ch} output channel(s), {self.sample_rate} Hz")
+        
         try:
             with sd.Stream(
                 samplerate=self.sample_rate,
-                channels=2,
+                channels=(input_ch, output_ch),  # Different channel counts for input/output
                 dtype=np.float32,
                 blocksize=2048,  # Smaller blocksize for lower latency
                 latency='high',
@@ -514,12 +662,19 @@ def main():
         logger.info("Platform: Raspberry Pi")
         input_device = find_usb_audio_device()
         if input_device is None:
-            logger.error("USB audio device not found!")
+            logger.error("USB audio device (UFO202) not found!")
             logger.info("\nAvailable input devices:")
             devices = sd.query_devices()
+            input_found = False
             for i, device in enumerate(devices):
                 if device['max_input_channels'] > 0:
                     logger.info(f"  {i}: {device['name']}")
+                    input_found = True
+            if not input_found:
+                logger.error("\nNo input devices found! Please ensure:")
+                logger.error("  1. UFO202 is connected via USB")
+                logger.error("  2. USB devices are properly recognized by the system")
+                logger.error("  3. Run 'lsusb' to verify USB devices are detected")
             sys.exit(1)
         
         output_device = find_pi_output_device()
