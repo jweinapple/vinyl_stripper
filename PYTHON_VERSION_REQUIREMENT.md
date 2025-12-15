@@ -66,8 +66,14 @@ python3.11 -m venv venv311
 source venv311/bin/activate
 
 # Install dependencies
-pip install --upgrade pip
-pip install numpy sounddevice tensorflow==2.13.0 tensorflow-estimator spleeter
+pip install --upgrade pip setuptools wheel
+
+# Install in correct order to avoid conflicts
+pip install "numpy>=1.19.0,<1.24.0"
+pip install tensorflow==2.12.1
+pip install tensorflow-estimator==2.12.0
+pip install sounddevice
+pip install spleeter==2.4.2
 ```
 
 ## Using the New Environment
@@ -97,9 +103,16 @@ python3 --version
 - Try: `pyenv install -v 3.11.9` for verbose output
 
 ### If TensorFlow still has issues:
-- Ensure you're using `tensorflow==2.13.0` (not 2.20.0)
-- Verify `tensorflow-estimator` is installed
+- Ensure you're using `tensorflow==2.12.1` (required by Spleeter 2.4.2)
+- Verify `tensorflow-estimator==2.12.0` is installed
+- Check that numpy version is compatible (`>=1.19.0,<1.24.0`)
 - Check that the TensorFlow compatibility patches in `test_spleeter_new.py` are active
+
+### Dependency Conflicts:
+If you see dependency conflicts:
+- **Spleeter 2.4.2 requires TensorFlow 2.12.1** (not 2.13.0)
+- Install packages in order: numpy → tensorflow → tensorflow-estimator → spleeter
+- Use the setup script which handles this automatically
 
 ## Alternative: Deadsnakes PPA (Ubuntu only)
 

@@ -109,7 +109,27 @@ pip install --upgrade pip
 # Install dependencies
 echo ""
 echo "Installing dependencies..."
-pip install numpy sounddevice tensorflow==2.13.0 tensorflow-estimator spleeter
+echo "Note: Installing compatible versions for Spleeter..."
+echo ""
+
+# Install dependencies in the correct order to avoid conflicts
+# Spleeter 2.4.2 requires tensorflow==2.12.1, so we need to match that
+pip install --upgrade pip setuptools wheel
+
+# Install numpy first (compatible version for TensorFlow 2.12.1)
+pip install "numpy>=1.19.0,<1.24.0"
+
+# Install TensorFlow 2.12.1 (required by Spleeter 2.4.2)
+pip install tensorflow==2.12.1
+
+# Install tensorflow-estimator (compatible with 2.12.1)
+pip install tensorflow-estimator==2.12.0
+
+# Install sounddevice (no version constraints)
+pip install sounddevice
+
+# Finally install Spleeter (will use the correct TensorFlow version)
+pip install spleeter==2.4.2
 
 echo ""
 echo "=========================================="
