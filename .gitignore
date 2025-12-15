@@ -32,6 +32,8 @@ Thumbs.db
 .cache/
 *.pth
 *.th
+pretrained_models/
+
 
 
 
