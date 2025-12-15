@@ -84,6 +84,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Platform detection
+IS_RASPBERRY_PI = os.path.exists('/proc/device-tree/model') and \
+                  'raspberry pi' in open('/proc/device-tree/model').read().lower() \
+                  if os.path.exists('/proc/device-tree/model') else False
+
+# Platform-specific defaults
+if IS_RASPBERRY_PI:
+    DEFAULT_CHUNK_DURATION = 2.5  # Pi needs smaller chunks
+    DEFAULT_MIN_BUFFER = 15.0      # Pi needs larger buffer
+    DEFAULT_LOW_THRESHOLD = 5.0   # Pi needs higher threshold
+else:
+    DEFAULT_CHUNK_DURATION = 3.0   # Mac can handle larger chunks
+    DEFAULT_MIN_BUFFER = 8.0       # Mac needs smaller buffer
+    DEFAULT_LOW_THRESHOLD = 2.0    # Mac can use lower threshold
+
 
 def find_universal_audio_device():
     """Auto-detect Universal Audio Thunderbolt interface."""
@@ -117,6 +132,39 @@ def find_mac_speakers():
     return None
 
 
+def find_usb_audio_device():
+    """Auto-detect USB audio interface (for Pi)."""
+    devices = sd.query_devices()
+    for i, device in enumerate(devices):
+        name = device['name'].lower()
+        if ('usb' in name and ('codec' in name or 'audio' in name)) or \
+           any(x in name for x in ['uca202', 'ufo202', 'behringer', 'scarlett']):
+            if device['max_input_channels'] >= 2 and device['max_output_channels'] >= 2:
+                logger.info(f"Found USB audio device: {i} - {device['name']}")
+                return i
+    return None
+
+
+def find_pi_output_device():
+    """Auto-detect Pi output device (HiFi DAC HAT or headphone jack)."""
+    devices = sd.query_devices()
+    # Look for HiFi DAC HAT first
+    for i, device in enumerate(devices):
+        name = device['name'].lower()
+        if device['max_output_channels'] >= 2:
+            if ('hifiberry' in name and 'dac' in name) or 'bcm2835' in name:
+                logger.info(f"Found Pi output device: {i} - {device['name']}")
+                return i
+    # Fallback: default output
+    try:
+        default_output = sd.query_devices(kind='output')
+        logger.info(f"Using default output device: {default_output['index']} - {default_output['name']}")
+        return default_output['index']
+    except:
+        pass
+    return None
+
+
 class SpleeterProcessor:
     """Spleeter-based real-time audio processor."""
     
@@ -125,7 +173,7 @@ class SpleeterProcessor:
         self.output_device = output_device
         self.remove_vocals = remove_vocals
         self.sample_rate = 44100
-        self.chunk_duration = 3.0  # Larger chunks = less overhead per second (optimized for efficiency)
+        self.chunk_duration = DEFAULT_CHUNK_DURATION  # Platform-specific chunk size
         self.chunk_samples = int(self.chunk_duration * self.sample_rate)
         self.overlap_samples = int(0.1 * self.sample_rate)  # 100ms overlap for smooth transitions
         self.hop_samples = self.chunk_samples - self.overlap_samples
@@ -200,8 +248,8 @@ class SpleeterProcessor:
         self.running = False
         self.use_passthrough = True
         self.prebuffer_complete = False
-        self.min_buffer_samples = int(8.0 * self.sample_rate)  # 8 second buffer (reduced since faster processing)
-        self.low_buffer_threshold = int(2.0 * self.sample_rate)  # Fallback to passthrough if below 2s
+        self.min_buffer_samples = int(DEFAULT_MIN_BUFFER * self.sample_rate)  # Platform-specific buffer
+        self.low_buffer_threshold = int(DEFAULT_LOW_THRESHOLD * self.sample_rate)  # Platform-specific threshold
         
         # Processing stats
         self.processing_times = deque(maxlen=20)
@@ -460,27 +508,50 @@ def main():
     logger.info("Spleeter Test Script (New)")
     logger.info("=" * 60)
     
-    # Find devices
+    # Find devices (platform-specific)
     logger.info("Detecting audio devices...")
-    input_device = find_universal_audio_device()
-    if input_device is None:
-        logger.error("Universal Audio device not found!")
-        logger.info("\nAvailable input devices:")
-        devices = sd.query_devices()
-        for i, device in enumerate(devices):
-            if device['max_input_channels'] > 0:
-                logger.info(f"  {i}: {device['name']}")
-        sys.exit(1)
-    
-    output_device = find_mac_speakers()
-    if output_device is None:
-        logger.error("Mac speakers not found!")
-        logger.info("\nAvailable output devices:")
-        devices = sd.query_devices()
-        for i, device in enumerate(devices):
-            if device['max_output_channels'] > 0:
-                logger.info(f"  {i}: {device['name']}")
-        sys.exit(1)
+    if IS_RASPBERRY_PI:
+        logger.info("Platform: Raspberry Pi")
+        input_device = find_usb_audio_device()
+        if input_device is None:
+            logger.error("USB audio device not found!")
+            logger.info("\nAvailable input devices:")
+            devices = sd.query_devices()
+            for i, device in enumerate(devices):
+                if device['max_input_channels'] > 0:
+                    logger.info(f"  {i}: {device['name']}")
+            sys.exit(1)
+        
+        output_device = find_pi_output_device()
+        if output_device is None:
+            logger.error("Pi output device not found!")
+            logger.info("\nAvailable output devices:")
+            devices = sd.query_devices()
+            for i, device in enumerate(devices):
+                if device['max_output_channels'] > 0:
+                    logger.info(f"  {i}: {device['name']}")
+            sys.exit(1)
+    else:
+        logger.info("Platform: Mac")
+        input_device = find_universal_audio_device()
+        if input_device is None:
+            logger.error("Universal Audio device not found!")
+            logger.info("\nAvailable input devices:")
+            devices = sd.query_devices()
+            for i, device in enumerate(devices):
+                if device['max_input_channels'] > 0:
+                    logger.info(f"  {i}: {device['name']}")
+            sys.exit(1)
+        
+        output_device = find_mac_speakers()
+        if output_device is None:
+            logger.error("Mac speakers not found!")
+            logger.info("\nAvailable output devices:")
+            devices = sd.query_devices()
+            for i, device in enumerate(devices):
+                if device['max_output_channels'] > 0:
+                    logger.info(f"  {i}: {device['name']}")
+            sys.exit(1)
     
     # Create and run processor
     try:
